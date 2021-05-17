@@ -1,0 +1,2878 @@
+---
+title: "Macrophage Analysis (2)"
+output: html_notebook
+---
+
+# Creating the integrated Seurat Object
+
+```{r eval=F, setup=T}
+
+#setwd("/usr/local/hdd/weinberger/analysis/")
+#.libPaths(c(.libPaths(), "/home/kami/R/x86_64-suse-linux-gnu-library/3.5/"))
+
+#LD_LIBRARY_PATH="/home/proj/software/R/Unix/R-4.0.1/lib$LD_LIBRARY_PATH" /home/proj/software/R/Unix/R-4.0.1/bin/R
+# BiocManager::install("biomaRt", INSTALL_opts = '--no-lock')
+
+setwd("/mnt/input/own/SeqMappings/Schulz_TenXSinglecell/Weinberger/2020-10/seurat")
+
+library("Seurat")
+library(ggplot2)
+library(cowplot)
+library(stringr)
+library(dplyr)
+library(tidyverse)
+library(bigmemory)
+library(biganalytics)
+library(pbapply)
+library(org.Mm.eg.db)
+library(clusterProfiler)
+library("enrichplot")
+library(data.table)
+library("writexl")
+library("EnhancedVolcano")
+library(ggsunburst)
+library(ggrepel)
+library(RColorBrewer)
+library(svglite)
+library(ggpubr)
+
+
+save_plot = function(plotobj,outname, fig.width, fig.height)
+{
+  print(paste(outname, fig.width, fig.height))
+  
+  png(filename=paste(outname, "png", sep="."), width = fig.width*100, height=fig.height*100)
+  plot(plotobj)
+  dev.off()
+  
+  pdf(file=paste(outname, "pdf", sep="."), width = fig.width, height=fig.height)
+  plot(plotobj)
+  dev.off()
+  
+  svglite::svglite(file = paste(outname, "svg", sep="."), width = fig.width, height = fig.height)
+  
+  plot(plotobj)
+  dev.off()
+  
+  return(plotobj)
+}
+
+```
+## regular functions
+
+
+```{r eval=F}
+
+cbind.fill <- function(...){
+  nm <- list(...) 
+  nm <- lapply(nm, as.matrix)
+  n <- max(sapply(nm, nrow)) 
+  do.call(cbind, lapply(nm, function (x) 
+    rbind(x, matrix(, n-nrow(x), ncol(x))))) 
+}
+
+make_descr_label = function(plot, descr)
+{
+  descrLabel <- ggdraw() + draw_label(descr, fontface='bold', angle = 0)
+  
+  pe = cowplot::plot_grid(descrLabel, plot, ncol=1, nrow=2, labels=NULL,rel_heights = c(0.1, 1),
+                          align = "h", axis = "l")
+  
+  return(pe)
+}
+
+makeSideBySideDotPlot = function(scobj, plotElems, featureGenes = c("Csf1r", "Chil3"), group.by="cellnames_manual",   col.min = -3, col.max = 3, cols = c("grey", "blue"), scaled=T, features.rotate=T, rel.width.legend=0.05, plot.title="")
+{
+  
+  featureGenes.orig = featureGenes
+  featureGenes = intersect(featureGenes, rownames(scobj))
+  
+  plot_list = list()
+  plot_orig_list = list()
+  allFoundFeatures = c()
+  allFoundGroups = c()
+  
+  elemCount = 0
+  for (plotName in names(plotElems))
+  {
+    print(plotName)
+    plotData = plotElems[[plotName]]
+    plotCells = plotData$cells
+    plotDescr = plotData$label
+    
+    if (scaled)
+    {
+      plotElem_orig = DotPlot(subset(scobj, cells=plotCells), features=featureGenes, group.by = group.by, col.min = col.min, col.max=col.max, cols=cols, scale=scaled)
+      
+    } else {
+      plotElem_orig = DotPlot(subset(scobj, cells=plotCells), features=featureGenes, group.by = group.by, cols=cols, scale=scaled)
+      
+      # https://github.com/satijalab/seurat/issues/2798
+      plotElem_orig$layers[[1]] <- NULL # remove original geom_point layer where the color scale is hard-coded to use scaled average expression
+      
+      plotElem_orig$data[plotElem_orig$data$avg.exp>col.max, 'avg.exp'] = col.max
+      plotElem_orig$data[plotElem_orig$data$avg.exp<col.min, 'avg.exp'] = col.min
+      
+      plotElem_orig <- plotElem_orig + 
+        geom_point(mapping = aes_string(size = 'pct.exp', color = 'avg.exp')) +
+        guides(color = guide_colorbar(title = 'Average Expression'))
+    }
+    
+    allFoundFeatures = unique(c(allFoundFeatures, as.character(plotElem_orig$data$features.plot)))
+    allFoundGroups = unique(c(allFoundGroups, as.character(plotElem_orig$data$id)))
+    
+    
+    plotElem_orig = plotElem_orig + scale_color_gradient(limits=c(col.min, col.max), low = cols[1], high = cols[2])
+    plotElem_orig = plotElem_orig + theme(axis.title.x=element_blank(), axis.title.y=element_blank(), legend.position = "none")
+    
+    if (features.rotate)
+    {
+      plotElem_orig= plotElem_orig + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+    }
+    
+    plot_orig_list[[plotName]] = plotElem_orig
+  }
+  
+  
+  if (scaled)
+  {
+    
+    # calculate avg.exp.scaled2 for each feature
+    for (featureName in allFoundFeatures)
+    {
+      
+      allUnscaledValues = data.frame()
+      for (plotName in names(plot_orig_list))
+      {
+        pData = plot_orig_list[[plotName]]$data
+        newDF = data.frame(pData[ pData$features.plot==featureName, ]$avg.exp)
+        colnames(newDF) = c(plotName)
+        
+        allUnscaledValues = cbind.fill(allUnscaledValues, newDF)
+      }
+      
+      sampleNames = colnames(allUnscaledValues)
+      allUnscaledValues = as.data.frame(allUnscaledValues)
+      allUnscaledValues$rnames = as.numeric(rownames(allUnscaledValues))
+      
+      allUnscaledLong = allUnscaledValues %>% gather(Type, Value, sampleNames)
+      allUnscaledLong$Value = scale(allUnscaledLong$Value)
+      
+      allScaledValues = allUnscaledLong %>% spread(Type, Value) %>% arrange( order(rnames))
+      allScaledValues
+      
+      for (plotName in names(plot_orig_list))
+      {
+        
+        plotElem_orig = plot_orig_list[[plotName]]
+        pData = plotElem_orig$data
+        
+        
+        # https://github.com/satijalab/seurat/issues/2798
+        plotElem_orig$layers[[1]] <- NULL # remove original geom_point layer where the color scale is hard-coded to use scaled average expression
+        
+        plotElem_orig$data[plotElem_orig$data$features.plot==featureName, "avg.exp.scaled2"] = allScaledValues[!is.na(allScaledValues[, plotName]),plotName]
+        plot_orig_list[[plotName]] = plotElem_orig
+      }
+    }
+    
+    
+    
+    for (plotName in names(plot_orig_list))
+    {
+      for (featureName in allFoundFeatures)
+      {
+        plotElem_orig = plot_orig_list[[plotName]]
+        pData = plotElem_orig$data
+        
+        for (groupName in allFoundGroups)
+        {
+          
+          subdf = pData[pData$id == groupName & pData$features.plot == featureName,]
+          
+          if (nrow(subdf) == 0)
+          {
+            print(paste(plotName, featureName, groupName))
+            addDF = data.frame(avg.exp=0, pct.exp=0, features.plot=featureName, id=groupName, avg.exp.scaled=col.min, avg.exp.scaled2=col.min, stringsAsFactors = FALSE)
+            rownames(addDF) = featureName
+            
+            plotElem_orig$data$id <- as.character(plotElem_orig$data$id)
+            
+            plotElem_orig$data = rbind(plotElem_orig$data, addDF)
+            
+            plotElem_orig$data$id <- as.factor(plotElem_orig$data$id)
+            
+            plot_orig_list[[plotName]] = plotElem_orig
+          }
+          
+        }
+      }
+    }
+    
+    for (plotName in names(plot_orig_list))
+    {
+      plotElem_orig = plot_orig_list[[plotName]]
+      pData = plotElem_orig$data
+      
+      plotElem_orig$data[plotElem_orig$data$avg.exp.scaled2>col.max, 'avg.exp.scaled2'] = col.max
+      plotElem_orig$data[plotElem_orig$data$avg.exp.scaled2<col.min, 'avg.exp.scaled2'] = col.min
+      
+      plotElem_orig <- plotElem_orig + 
+        geom_point(mapping = aes_string(size = 'pct.exp', color = 'avg.exp.scaled2')) +
+        guides(color = guide_colorbar(title = 'Average Scaled Expression'))
+      
+      plotElem_orig = plotElem_orig + scale_color_gradient(limits=c(col.min, col.max), low = cols[1], high = cols[2])
+      plotElem_orig = plotElem_orig + theme(axis.title.x=element_blank(), axis.title.y=element_blank(), legend.position = "none")
+      
+      plot_orig_list[[plotName]] = plotElem_orig
+    }
+  }
+  
+  
+  
+  elemCount = 0
+  plot_list=list()
+  for (plotName in names(plot_orig_list))
+  {
+    
+    plotElem_orig = plot_orig_list[[plotName]]
+    
+    elemCount = elemCount + 1
+    
+    plotElem = plotElem_orig +  theme(
+      axis.text.y = element_blank(),
+      panel.grid.major.x = element_line( size=.1, color="black" ),
+      axis.line.y = element_line(size = 0),
+      axis.ticks.length.y = unit(0, "points")
+    )
+    
+    pe = make_descr_label(plotElem, plotElems[[plotName]]$label)
+    
+    plot_list[[plotName]] = pe
+    
+  }
+  
+  legendDescr = 'Average Expression'
+  if (scaled)
+  {
+    legendDescr = 'Average Scaled Expression'  
+  }
+  
+  # extract a legend that is laid out horizontally #
+  legend_b <- get_legend(
+    plotElem_orig + 
+      guides(color = guide_colorbar(title = legendDescr, direction="horizontal"))+ #guide_legend(nrow = 1, override.aes = list(size=6)))+
+      theme(legend.position = "bottom")
+  )
+  
+  title <- ggdraw() + draw_label(plot.title, fontface='bold')
+  
+  plotElem_new = plot_orig_list[[names(plot_orig_list)[[1]]]]
+  plotElem_new$layers[[1]] = NULL
+  pa = plotElem_new + theme(axis.text.x=element_text(colour = "white")) #+ xlim("", "B")
+  pal = make_descr_label(pa, "")
+  
+  
+  plist = list()
+  plist[["Legend"]] = pal
+  
+  for (le in names(plot_list))
+  {
+    plist[[le]] = plot_list[[le]]
+  }
+  
+  ap=cowplot::plot_grid(
+    plotlist = plist,
+    labels = NULL,
+    nrow=1, rel_widths = c(rel.width.legend, rep(0.1, length(plot_list))),
+    align = "v", axis="bt"
+  )
+  
+  fp = cowplot::plot_grid(title, ap, legend_b, ncol = 1, rel_heights = c(0.05, 1, 0.1) )
+  return(fp)
+}
+
+```
+
+
+##einstein_exec
+```{r eval=F}
+
+sampleDF = read.csv("samples.df.tsv", sep="\t")
+sampleDF
+```
+
+
+```{r eval=F}
+allMtx = list.files(path="../calls/", pattern="*.mtx.gz", full.names=T, recursive=TRUE)
+files.ccrfire = grep(x = allMtx, pattern="/outs/", value = T)
+files.ccrfire = grep(x = files.ccrfire, pattern="filtered", value = T)
+files.ccrfire
+
+allMtx = list.files(path="../20133_count/", pattern="*.mtx.gz", full.names=T, recursive=TRUE)
+files.new = grep(x = allMtx, pattern="filtered", value = T)
+files.new
+
+files.heart = c("../Heart1//Heart1/filtered_feature_bc_matrix/matrix.mtx.gz")
+files.heart
+
+paste(sampleDF[substring(sampleDF$condition, 1, 4) == "CCR2",]$sample_id, sep="|")
+
+files.ccrfire = grep(x = files.ccrfire, pattern=paste(sampleDF[substring(sampleDF$condition, 1, 4) == "CCR2",]$sample_id, collapse = "|"), invert=T, value=T)
+files.ccrfire
+```
+
+```{r eval=F}
+allfiles = list()
+for (file in c(files.heart, files.ccrfire, files.new))
+{
+  samplename = str_split(dirname(file), "/")[[1]][4]
+  print(samplename)
+  foldername = dirname(file)
+  
+
+  print(paste(foldername, samplename))
+  
+  allfiles[[samplename]] = Read10X(foldername, unique.features = TRUE)
+}
+
+```
+
+
+```{r eval=F}
+
+
+toCellPrefix = function(x) {
+    datasetprefix = x
+    datasetprefix = str_replace_all(datasetprefix, "[./]", "")
+    datasetprefix = str_split(datasetprefix, "_")[[1]][1]
+    
+    return(paste(datasetprefix, sep=""))
+}
+
+makeSeuratObj = function(matrix, proj, minUMIs, plots)
+{
+      obj = CreateSeuratObject(matrix, project=proj)
+    print("Renaming Cells")
+    obj <- RenameCells(obj, add.cell.id=proj)
+    
+    print(paste("Seurat obj project", obj@project.name))
+    
+    #obj[["percent.mtrp"]] <- PercentageFeatureSet(obj, pattern = "^mt-|^Rps|^Rpl")
+    
+    mtPattern = "^mt-"
+    rplPattern = "^Rpl"
+    rpsPattern = "^Rps"
+    rpPattern = "^Rps|^Rpl"
+    
+    selGenes = rownames(obj)[grepl(rownames(obj), pattern=mtPattern)]
+    print(paste("Got a total of mt-Genes:", length(selGenes), paste0(head(unlist(selGenes)), collapse=", ")))
+    
+    selGenes = rownames(obj)[grepl(rownames(obj), pattern=rplPattern)]
+    print(paste("Got a total of Rpl-Genes:", length(selGenes), paste0(head(unlist(selGenes)), collapse=", ")))
+    
+    selGenes = rownames(obj)[grepl(rownames(obj), pattern=rpsPattern)]
+    print(paste("Got a total of Rps-Genes:", length(selGenes), paste0(head(unlist(selGenes)), collapse=", ")))
+    
+    selGenes = rownames(obj)[grepl(rownames(obj), pattern=rpPattern)]
+    print(paste("Got a total of Rp-Genes:", length(selGenes), paste0(head(unlist(selGenes)), collapse=", ")))
+    
+    obj[["percent.mt"]] <- PercentageFeatureSet(obj, pattern = mtPattern)
+    obj[["percent.rpl"]] <- PercentageFeatureSet(obj, pattern = rplPattern)
+    obj[["percent.rps"]] <- PercentageFeatureSet(obj, pattern = rpsPattern)
+    obj[["percent.rp"]] <- PercentageFeatureSet(obj, pattern = rpPattern)
+    
+    if (plots)
+    {
+      plot1 <- FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "percent.mt")
+      plot2 <- FeatureScatter(obj, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+      show(plot1 + scale_x_continuous(n.breaks = 20) + scale_y_continuous(n.breaks = 20))
+
+    }
+    
+
+    # mt content: https://www.ncbi.nlm.nih.gov/pmc/articles/PMC6072887/
+    obj <- subset(obj, subset = nFeature_RNA > 200 & nFeature_RNA < 6000 & nCount_RNA > minUMIs & percent.mt < 15 & percent.rp < 40)
+
+    obj <- NormalizeData(obj, verbose = FALSE)
+    obj <- FindVariableFeatures(obj, verbose = FALSE)
+    
+    return(obj)
+}
+
+
+objlist = list()
+
+for (x in names(allfiles))
+{
+
+  
+  print(x)
+
+  matrix = allfiles[[x]]
+  
+  filteredAll = dim(matrix)[2]
+  
+  filteredObj = makeSeuratObj(matrix, x, 1000, TRUE)
+  
+  print(paste(x, filteredAll, ncol(filteredObj)))
+
+  objlist[[x]] = filteredObj
+  
+    
+}
+
+
+```
+
+```{r eval=F}
+objlist[[1]]@project.name
+```
+
+
+```{r eval=F}
+print("cells per experiment")
+print(mapply(sum, lapply(objlist, function(x) {dim(x)[2]})))
+print("total cells")
+print(sum(mapply(sum, lapply(objlist, function(x) {dim(x)[2]}))))
+
+```
+
+
+```{r eval=F}
+
+features <- SelectIntegrationFeatures(object.list = objlist)
+rpmtFeatures = features[grep("^Rps|^Rpl|Mt-", features)]
+
+noRPMTFeatures = features[grep("^Rps|^Rpl|Mt-", features, invert = TRUE)][1:2000]
+length(noRPMTFeatures)
+
+"EYFP" %in% noRPMTFeatures
+
+```
+
+```{r eval=F}
+objlist <- lapply(X = objlist, FUN = function(x) {
+    print(x)
+    #x <- ScaleData(x, features = noRPMTFeatures, verbose = FALSE, vars.to.regress = c('percent.rp', 'percent.mt'))
+    #x <- RunPCA(x, features = noRPMTFeatures, npcs = 50, verbose = FALSE)
+  
+    suppressWarnings( x <- SCTransform(x, vars.to.regress = c('percent.rp', 'percent.mt'), verbose=FALSE) )
+})
+
+```
+
+
+```{r eval=F}
+anchors1 = NULL
+obj1.integrated=NULL
+r=NULL
+rep1Data=NULL
+features1=NULL
+```
+
+
+```{r eval=F}
+#load("before_integration_rep.RData")
+save.image(file="before_integration.v4.final.RData", compress = F)
+
+```
+
+```{r eval=F}
+
+objlist.features <- SelectIntegrationFeatures(object.list = objlist, nfeatures = 2000)
+
+options(future.globals.maxSize= 16000*1024^2)
+
+objlist.list <- PrepSCTIntegration(object.list = objlist, anchor.features = objlist.features, verbose = FALSE)
+
+objlist.anchors <- FindIntegrationAnchors(object.list = objlist.list, normalization.method = "SCT", anchor.features = objlist.features, verbose = FALSE)
+
+save.image("before_integration_2.v4.final.RData", compress = FALSE)
+
+obj.integrated <- IntegrateData(anchorset = objlist.anchors, normalization.method = "SCT", verbose = T)
+
+save.image("integrated.v4.final.RData", compress = FALSE)
+
+```
+
+
+
+
+```{r eval=F}
+
+obj.integrated <- ScaleData(obj.integrated, verbose = FALSE)
+obj.integrated <- RunPCA(obj.integrated, verbose = FALSE)
+obj.integrated <- RunUMAP(obj.integrated, dims = 1:50, return.model = TRUE)
+
+obj.integrated <- FindNeighbors(obj.integrated, dims = 1:50)
+
+```
+
+```{r eval=F}
+
+DefaultAssay(obj.integrated) = "integrated"
+obj.integrated <- FindClusters(obj.integrated, resolution = 0.8)
+
+obj.integrated$idents = Idents(obj.integrated)
+```
+
+```{r eval=F}
+obj.integrated
+```
+
+```{r eval=F}
+
+DimPlot(obj.integrated, pt.size = 0.001)
+
+```
+
+
+```{r eval=F}
+
+m2hc = read.table("m2h_conversion", sep="\t", header = T)
+
+obj_heart_atlas = readRDS("obj_heart_atlas.RDS")
+obj_heart_atlas
+
+mat_heart_atlas = as.matrix(GetAssayData(obj_heart_atlas, slot="counts"))
+
+sub_mat_heart_atlas = mat_heart_atlas[m2hc$To,]
+rownames(sub_mat_heart_atlas) = m2hc$From
+
+heartAtlas = makeSeuratObj(sub_mat_heart_atlas, "human_heart_atlas", 1000, TRUE)
+
+suppressWarnings( heartAtlas <- SCTransform(heartAtlas, vars.to.regress = c('percent.rp', 'percent.mt'), verbose=FALSE) )
+suppressWarnings( obj.integrated <- SCTransform(obj.integrated, vars.to.regress = c('percent.rp', 'percent.mt'), verbose=FALSE) )
+
+DefaultAssay(obj.integrated) = "SCT"
+
+#heartAtlas <- NormalizeData(heartAtlas, verbose = FALSE)
+#heartAtlas <- FindVariableFeatures(heartAtlas, selection.method = "vst", nfeatures = 2000, verbose = FALSE)
+
+heart.anchors <- FindTransferAnchors(reference = obj.integrated, query = heartAtlas, dims = 1:30, normalization.method = "SCT")
+heartAtlas <- IntegrateEmbeddings(anchorset = heart.anchors, reference = obj.integrated, query = heartAtlas, new.reduction.name = "ref.pca", reuse.weights.matrix=F)
+heartAtlas <- ProjectUMAP(query = heartAtlas, query.reduction = "ref.pca", reference = obj.integrated, 
+    reference.reduction = "pca", reduction.model = "umap")
+
+```
+
+```{r fig.width=15, fig.height=8}
+
+hca_cellnames = obj_heart_atlas$cell_states
+names(hca_cellnames) = paste("human_heart_atlas_", names(hca_cellnames), sep="")
+heartAtlas$cell_state = hca_cellnames
+
+
+p1 <- DimPlot(obj.integrated, reduction = "umap", label = TRUE, label.size = 3, 
+    repel = TRUE) + NoLegend() + ggtitle("Reference annotations")
+p2 <- DimPlot(heartAtlas, reduction = "ref.umap", group.by="cell_state", label = TRUE, 
+    label.size = 3, repel = TRUE) + ggtitle("Query transferred labels")
+p1 + p2
+
+```
+
+
+
+```{r eval=F}
+
+DimPlot(obj.integrated, pt.size = 0.001)
+
+```
+
+#remotes::install_version("Seurat", version = "3.2.3", INSTALL_opts = '--no-lock')
+#remotes::install_github("mojaveazure/seurat-disk", INSTALL_opts = '--no-lock')
+
+
+```{r eval=F}
+
+save.image(file="integrated.v4.umap.final.RData", compress = F)
+
+
+```
+
+```{r eval=F}
+sampleDF
+```
+
+
+# setting samples
+
+```{r eval=F}
+
+
+#
+# CONDITON
+#
+#
+
+cellList = colnames(obj.integrated)
+featVec <- vector(mode="character", length=length(cellList))
+
+for (row in 1:nrow(sampleDF))
+{
+  rowData = sampleDF[row,]
+  
+  featVec[grep(x = cellList, pattern = paste("^", rowData$sample_id, sep=""))] = rowData$condition
+
+}
+
+unique(featVec)
+obj.integrated$sample=featVec
+
+#
+#
+# ANIMAL
+#
+#
+#
+
+cellList = colnames(obj.integrated)
+featVec <- vector(mode="character", length=length(cellList))
+
+for (row in 1:nrow(sampleDF))
+{
+  rowData = sampleDF[row,]
+  
+  featVec[grep(x = cellList, pattern = paste("^", rowData$sample_id, sep=""))] = rowData$animal
+
+}
+
+unique(featVec)
+obj.integrated$animal=featVec
+
+#
+#
+# DISEASE STATE
+#
+#
+#
+
+cellList = colnames(obj.integrated)
+featVec <- vector(mode="character", length=length(cellList))
+
+for (row in 1:nrow(sampleDF))
+{
+  rowData = sampleDF[row,]
+  
+  featVec[grep(x = cellList, pattern = paste("^", rowData$sample_id, sep=""))] = rowData$infarct_condition
+
+}
+
+unique(featVec)
+obj.integrated$state=featVec
+
+ccr2_wt_if_cells = names(obj.integrated$sample[obj.integrated$sample == "CCR2_IF_WT"])
+ccr2_ko_if_cells = names(obj.integrated$sample[obj.integrated$sample == "CCR2_IF_KO"])
+fire_wt_if_cells = names(obj.integrated$sample[obj.integrated$sample == "FIRE_IF_WT"])
+fire_ko_if_cells = names(obj.integrated$sample[obj.integrated$sample == "FIRE_IF_KO"])
+
+fire_ct_ni_cells = names(obj.integrated$sample[obj.integrated$sample == "FIRE_NI_CTRL"])
+fire_ko_ni_cells = names(obj.integrated$sample[obj.integrated$sample == "FIRE_NI_KO"])
+
+heart_ni_cells = names(obj.integrated$sample[obj.integrated$sample == "HEART_NI"])
+
+
+print(paste("fire wt if", length(fire_wt_if_cells)))
+print(paste("fire ko if", length(fire_ko_if_cells)))
+print(paste("fire wt ni", length(fire_ct_ni_cells)))
+print(paste("fire ko ni", length(fire_ko_ni_cells)))
+
+print(paste("heart ni", length(heart_ni_cells)))
+
+```
+
+```{r eval=F, fig.width=16, fig.height=32}
+
+DimPlot(obj.integrated, split.by="sample", ncol=2, label = T)
+
+```
+
+
+```{r eval=F}
+save.image(file="integrated.v4.umap.final.RData", compress = F)
+```
+
+
+# Quality Checks
+
+```{r eval=F}
+obj.integrated <- CellCycleScoring(
+  object = obj.integrated,
+  g2m.features = cc.genes$g2m.genes,
+  s.features = cc.genes$s.genes
+)
+
+VlnPlot(obj.integrated, features = c("S.Score","G2M.Score"), group.by = "idents", pt.size = 0.05)
+```
+
+```{r eval=F, fig.height=6, fig.width=12}
+
+FeaturePlot(obj.integrated, features = c("S.Score", "G2M.Score"), order=T)
+
+```
+
+
+```{r eval=F, fig.height=6, fig.width=12}
+
+FeaturePlot(subset(obj.integrated, cells=fire_ct_ni_cells), features = c("percent.mt", "percent.rp"), order=T)
+
+```
+
+```{r eval=F}
+#obj.integrated <- NormalizeData(obj.integrated, verbose = FALSE)
+#obj.integrated <- FindVariableFeatures(obj.integrated, verbose = FALSE)
+#obj.integrated <- ScaleData(obj.integrated, features = features, verbose = FALSE)
+#obj.integrated <- RunPCA(obj.integrated, features = features, npcs = 70, verbose = FALSE)
+#obj.integrated <- RunUMAP(obj.integrated, dims = 1:70)
+
+```
+
+```{r eval=F, fig.width=15, fig.height=6}
+
+DimPlot(obj.integrated, pt.size = 0.05, label=T)
+
+```
+
+```{r eval=F, fig.height=30, fig.width=8}
+
+DimPlot(obj.integrated, split.by="idents", ncol=1)
+
+```
+
+
+
+```{r eval=FALSE}
+
+DefaultAssay(object=obj.integrated) = "RNA"
+
+obj.integrated <- ScaleData(obj.integrated, verbose = FALSE)
+
+obj.integrated[["percent.mt"]] <- PercentageFeatureSet(obj.integrated, pattern = "^mt-")
+obj.integrated[["percent.rpl"]] <- PercentageFeatureSet(obj.integrated, pattern = "^Rpl")
+obj.integrated[["percent.rps"]] <- PercentageFeatureSet(obj.integrated, pattern = "^Rps")
+obj.integrated[["percent.rp"]] <- PercentageFeatureSet(obj.integrated, pattern = "^Rps|^Rpl")
+
+```
+
+```{r eval=F, fig.width=20, fig.height=15}
+VlnPlot(obj.integrated, features = c("nFeature_RNA", "nCount_RNA", "percent.mt", "percent.rp"), group.by = "animal",  ncol = 2)
+```
+
+```{r eval=F, fig.width=20, fig.height=7}
+VlnPlot(obj.integrated, features = c("percent.rp"), group.by = "animal", pt.size = 0)
+```
+
+```{r eval=F, fig.width=20, fig.height=7}
+VlnPlot(obj.integrated, features = c("nCount_RNA"), group.by = "animal", pt.size = 0)
+```
+
+
+```{r eval=F, fig.width=20, fig.height=7}
+VlnPlot(obj.integrated, features = c("percent.mt"), group.by = "sample", pt.size = 0)
+```
+
+```{r eval=F}
+FeatureScatter(obj.integrated, feature1 = "nCount_RNA", feature2 = "nFeature_RNA", pt.size = 0.01)
+
+```
+
+
+```{r eval=F, fig.width=15, fig.height=5}
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+
+plot1 <- FeatureScatter(obj.integrated, feature1 = "nCount_RNA", feature2 = "percent.mt")
+plot2 <- FeatureScatter(obj.integrated, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+
+cowplot::plot_grid(plot1, plot2)
+
+```
+
+```{r eval=F, fig.width=15, fig.height=5}
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+
+FeatureScatter(obj.integrated, feature1 = "percent.rp", feature2 = "percent.mt")
+
+```
+
+```{r eval=F, fig.width=15, fig.height=5}
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+
+plot1 <- FeatureScatter(obj.integrated, feature1 = "Ccr2", feature2 = "Rps6", group.by = "sample", pt.size = 0.05)
+plot2 <- FeatureScatter(obj.integrated, feature1 = "Rpl24", feature2 = "Rps23", group.by = "sample", pt.size = 0.05)
+
+cowplot::plot_grid(plot1, plot2)
+
+```
+
+```{r eval=F, fig.width=15, fig.height=5}
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+
+plot1 <- FeatureScatter(obj.integrated, feature1 = "percent.rps", feature2 = "nFeature_RNA", group.by = "sample", pt.size = 0.05)
+plot2 <- FeatureScatter(obj.integrated, feature1 = "percent.rpl", feature2 = "nFeature_RNA", group.by = "sample", pt.size = 0.05)
+
+cowplot::plot_grid(plot1, plot2)
+
+```
+
+```{r eval=F}
+obj.integrated
+```
+
+
+```{r eval=F, fig.width=15, fig.height=5}
+# FeatureScatter is typically used to visualize feature-feature relationships, but can be used
+# for anything calculated by the object, i.e. columns in object metadata, PC scores etc.
+
+plot1 <- FeatureScatter(obj.integrated, feature1 = "Ccr2", feature2 = "percent.rps", group.by = "animal")
+plot2 <- FeatureScatter(obj.integrated, feature1 = "Ccr2", feature2 = "percent.rpl", group.by = "animal")
+plot3 <- FeatureScatter(obj.integrated, feature1 = "Ccr2", feature2 = "percent.rp", group.by = "animal")
+
+cowplot::plot_grid(plot1, plot2, plot3)
+
+```
+
+
+
+
+```{r eval=F, fig.width=15, fig.height=5}
+
+obj.integrated = FindVariableFeatures(object = obj.integrated)
+
+# Identify the 10 most highly variable genes
+topVar <- head(VariableFeatures(obj.integrated), 50)
+
+# plot variable features with and without labels
+plot1 <- VariableFeaturePlot(obj.integrated)
+plot2 <- LabelPoints(plot = plot1, points = topVar, repel = TRUE)
+
+plot2
+
+```
+
+```{r eval=F}
+rpmtFeatures = VariableFeatures(obj.integrated)[grep("^Rps|^Rpl|Mt-", VariableFeatures(obj.integrated))]
+rpmtFeatures
+```
+
+```{r eval=F}
+DimPlot(obj.integrated, reduction="pca", group.by = "animal")
+```
+
+
+```{r eval=F, fig.width=15}
+VizDimLoadings(obj.integrated, dims = 1:4, reduction = "pca")
+```
+
+```{r eval=F, fig.width=16, fig.height=32}
+
+DimPlot(obj.integrated, split.by="sample", ncol=2, label = T)
+
+```
+
+
+
+```{r eval=F, fig.width=30, fig.height=18}
+DefaultAssay(obj.integrated) = "RNA"
+p=FeaturePlot(obj.integrated, pt.size = 0.01, features = c("Csf1r", "Ccr2", "Ccl9", "Tnf", "Isg15", "Mx1", "Ccl2", "Rps19", "Cd19", "Lyve1"), reduction = "umap", max.cutoff = 15, split.by = "animal", order=T )
+
+save_plot(p, "featureplot_many_features", 35, 21)
+
+```
+
+
+```{r eval=F}
+
+makesummary = function(a, suffix)
+{
+  out = {}
+  out["num"] = length(a)
+  
+  if (length(a) == 0)
+  {
+    f = c(0,0,0,0,0)
+    meanA = 0
+  } else {
+    f = fivenum(a)
+    meanA = mean(a)
+  }
+
+  out["min"] = f[1]
+  out["lower_hinge"] = f[2]
+  out["median"] = f[3]
+  out["upper_hinge"] = f[4]
+  out["max"] = f[5]
+  out["mean"] = meanA
+  
+  names(out) = paste(names(out), suffix, sep=".")
+  
+  return(out)
+}
+
+getExprData = function(markerObj, markerCells, sampleSuffix, slot="data")
+{
+  expTable = GetAssayData(object = subset(x=markerObj, cells=markerCells), slot = slot)
+  allgenes = rownames(expTable)
+  cellnames = colnames(expTable)
+
+  expt.r = as(expTable, "dgTMatrix")
+  expt.df = data.frame(r = expt.r@i + 1, c = expt.r@j + 1, x = expt.r@x)
+
+  DT <- data.table(expt.df)
+  res = DT[, as.list(makesummary(x, sampleSuffix)), by = r]
+  res[[paste("anum", sampleSuffix, sep=".")]] = length(cellnames)
+  res$gene = allgenes[res$r]
+  
+  res = res[,r:=NULL]
+  
+  return(res)
+}
+
+getDEXpressionDF = function ( scdata, markers, assay="SCT", group.by=NULL)
+{
+
+outDF = NULL
+DefaultAssay(object=scdata) = assay
+
+print(group.by)
+
+if (is.null(group.by))
+{
+  clusterIDs = as.character(sort(unique(Idents(scdata))))
+} else {
+  clusterIDs = as.character(sort(unique(scdata[[group.by]][,])))
+}
+
+
+scCells = Idents(scdata)
+scCells = names(scCells)
+scCells = unlist(as.character(scCells))
+
+for (clusterID in clusterIDs){
+    
+    print(clusterID)
+    
+    cellIdents = Idents(scdata)
+    
+    if (is.null(group.by))
+    {
+      cellIdents.c = names(cellIdents[cellIdents == clusterID])
+
+    } else {
+      cellIdents.c = colnames(scdata[,scdata[[group.by]] == clusterID])
+    }
+    
+    cellIdents.c = unlist(lapply(cellIdents.c, as.character))  
+    
+    cellIdents.bg = setdiff(unlist(lapply(names(cellIdents), as.character)), cellIdents.c)
+    
+    expvals = getExprData(scdata, cellIdents.c, "cluster")
+    expvals.bg = getExprData(scdata, cellIdents.bg, "bg")
+
+    modmarkers = markers[[clusterID]]
+    modmarkers$gene = rownames(modmarkers)
+    
+    markerdf = as.data.frame(modmarkers)
+    
+    if ((nrow(markerdf) > 0) && (nrow(expvals) > 0))
+    {
+      expvals = merge(markerdf, expvals, all.x=T, by.x="gene", by.y = "gene")  
+    }
+    
+    if ((nrow(expvals) > 0) && (nrow(expvals.bg) > 0))
+    {
+      expvals = merge(expvals, expvals.bg, all.x=T, by.x="gene", by.y = "gene")  
+    }
+    
+    expvals = as.data.frame(cbind(clusterID, expvals))
+    
+    if (!is.data.frame(outDF) || nrow(outDF)==0)
+    {
+    outDF = expvals
+    } else {
+    outDF = as.data.frame(rbind(outDF, expvals))
+    }
+    
+}
+
+return(outDF)
+
+}
+
+
+makeDEResults = function(inobj, group.by=NULL, assay="SCT", test="wilcox")
+{
+
+  if (is.null(group.by))
+  {
+    clusterIDs = as.character(sort(unique(Idents(inobj))))
+  } else {
+    clusterIDs = as.character(sort(unique(inobj[[group.by]][,])))
+  }
+  
+  retList = list()
+  
+  for(clusterID in clusterIDs)
+  {
+  
+  
+      cellIdents = Idents(inobj)
+      
+      if (is.null(group.by))
+      {
+        cellIdents.c = names(cellIdents[cellIdents == clusterID])
+  
+      } else {
+        cellIdents.c = colnames(inobj[,inobj[[group.by]] == clusterID])
+      }
+      
+      cellIdents.c = unlist(lapply(cellIdents.c, as.character))
+  
+      print(paste("Processing cluster", clusterID, "with a total of", length(cellIdents.c), "cells"))
+  
+      deMarkers = FindMarkers(inobj, assay=assay, ident.1 = cellIdents.c, test.use=test)
+  
+  
+      retList[[clusterID]] = deMarkers
+  
+  }
+  
+  return(retList)
+
+}
+
+```
+
+
+```{r eval=F}
+
+#deResMastT = makeDEResults(obj.integrated, assay="RNA", test="MAST")
+#exprdfMastT = getDEXpressionDF(obj.integrated, deResMastT, assay="RNA")
+#write.table(exprdfMastT, "expr_test_mast.tsv", sep="\t", row.names=F, quote = F)
+#write_xlsx(exprdfMastT, "expr_test_mast.xlsx")
+
+
+deResTT = makeDEResults(obj.integrated, assay="RNA", test="t")
+exprdfTT = getDEXpressionDF(obj.integrated, deResTT, assay="RNA")
+write.table(exprdfTT, "expr_test_t.tsv", sep="\t", row.names=F, quote = F)
+write_xlsx(exprdfTT, "expr_test_t.xlsx")
+
+```
+
+```{r eval=F}
+exprdfTT
+```
+
+
+```{bash}
+wget https://raw.githubusercontent.com/mjoppich/scrnaseq_celltype_prediction/master/analyseMarkers.py
+```
+
+```{bash}
+/usr/bin/python3 analyseMarkers.py -i expr_test_t.tsv --expressing-cell-count "num.cluster" --cluster-cell-count "anum.cluster" --logfc "avg_log2FC" --expr-mean "mean.cluster" --organs "Immune system" -n 3
+```
+
+```{bash}
+/usr/bin/python3 analyseMarkers.py -i expr_test_t.tsv --expressing-cell-count "num.cluster" --cluster-cell-count "anum.cluster" --logfc "avg_log2FC" --expr-mean "mean.cluster" --organs "Immune system" --seurat
+```
+
+```{r eval=F}
+
+
+new.cluster.ids <- c("Neutrophils;Immune system","Neutrophils;Immune system","Macrophages;Immune system","Macrophages;Immune system","Macrophages;Immune system","Neutrophils;Immune system","B cells;Immune system","Neutrophils;Immune system","Neutrophils;Immune system","NK cells;Immune system","B cells;Immune system","Macrophages;Immune system","T memory cells;Immune system","Macrophages;Immune system","Macrophages;Immune system","Macrophages;Immune system","Monocytes;Immune system","Dendritic cells;Immune system")
+orignames = Idents(obj.integrated)
+names(new.cluster.ids) <- levels(orignames)
+levels(orignames) = new.cluster.ids
+obj.integrated$cellnames = orignames
+
+```
+
+```{r eval=F, fig.width=15, fig.height=8}
+
+DimPlot(obj.integrated, group.by = "cellnames", label=T)
+
+```
+
+```{r eval=F, fig.height=40, fig.width=8}
+
+DimPlot(heartAtlas, reduction = "ref.umap", split.by="cell_state", ncol=1)
+
+```
+
+
+```{r eval=F, fig.width=17, fig.height=8}
+
+hca_cellnames = obj_heart_atlas$cell_states
+names(hca_cellnames) = paste("human_heart_atlas_", names(hca_cellnames), sep="")
+heartAtlas$cell_state = hca_cellnames
+
+
+p1 <- DimPlot(obj.integrated, reduction = "umap", label = TRUE, label.size = 3, 
+    repel = TRUE, group.by="cellnames_common") + NoLegend() + ggtitle("Reference annotations")
+p2 <- DimPlot(heartAtlas, reduction = "ref.umap", group.by="cell_state", label = TRUE, 
+    label.size = 3, repel = TRUE) + ggtitle("Query transferred labels")
+p1 + p2
+
+```
+
+
+```{r eval=F, fig.width=15, fig.height=8}
+
+hca_cellnames = obj_heart_atlas$cell_states
+names(hca_cellnames) = paste("human_heart_atlas_", names(hca_cellnames), sep="")
+heartAtlas$cell_state = hca_cellnames
+
+
+p1 <- DimPlot(obj.integrated, reduction = "umap", label = TRUE, label.size = 3, 
+    repel = TRUE, group.by="idents") + NoLegend() + ggtitle("Reference annotations")
+p2 <- DimPlot(heartAtlas, reduction = "ref.umap", group.by="cell_state", label = TRUE, 
+    label.size = 3, repel = TRUE) + ggtitle("Query transferred labels")
+p1 + p2
+
+```
+
+```{r eval=F}
+FeaturePlot(obj.integrated, "Ly6c1", order = T)
+FeaturePlot(obj.integrated, "Ly6c2", order = T)
+FeaturePlot(obj.integrated, "Ccr2", order = T)
+```
+
+
+```{r eval=F}
+
+
+new.cluster.manual = c(
+"Neutrophils (SiglecF hi)",
+"Neutrophils (Tnf hi)",
+"Macrophages (homeostatic)",
+"Macrophages (Ccr2 lo, Ly6c lo)",
+"Macrophages (antigen presenting)",
+"Neutrophils (Retnlg hi, Cd9 hi)",
+"B cells 1",
+"Neutrophils (Retnlg hi)",
+"IFNIC",
+"NK cells",
+"B cells 2",
+"Macrophages (Cx3cr1 hi)",
+"T cells",
+"Macrophages (Ccr2 hi, Ly6c hi)",
+"cDC2",
+"Macrophages (Digesting)",
+"Monocytes (Ly6c hi)",
+"cDC1"
+)
+
+orignames = Idents(obj.integrated)
+names(new.cluster.manual) <- levels(orignames)
+levels(orignames) = new.cluster.manual
+obj.integrated$cellnames_manual = orignames
+obj.integrated
+
+
+new.cluster.manual_common = c(
+"Neutrophils (SiglecF hi)",
+"Neutrophils (Tnf hi)",
+"Macrophages (homeostatic)",
+"Macrophages (Ccr2 lo, Ly6c lo)",
+"Macrophages (antigen presenting)",
+"Neutrophils (Retnlg hi)",
+"B cells",
+"Neutrophils (Retnlg hi)",
+"IFNIC",
+"NK cells",
+"B cells",
+"Macrophages (Cx3cr1 hi)",
+"T cells",
+"Macrophages (Ccr2 hi, Ly6c hi)",
+"cDC2",
+"Macrophages (Digesting)",
+"Monocytes (Ly6c hi)",
+"cDC1"
+)
+
+orignames = Idents(obj.integrated)
+names(new.cluster.manual_common) <- levels(orignames)
+levels(orignames) = new.cluster.manual_common
+obj.integrated$cellnames_common = orignames
+obj.integrated
+
+
+```
+
+```{r eval=F}
+
+make_cluster_filename = function (scobj, group, srow=FALSE) {
+  
+  cluster_name_file = data.frame(matrix(ncol=3,nrow=0))
+
+
+  for (cellPop in unique(as.character(unlist(scobj[[group]]))))
+  {
+    print(cellPop)
+    varPop = str_to_lower( str_replace_all(str_replace_all(#
+                              str_replace_all( cellPop, "\\(|\\)| |,", "_"),
+                              "__", "_"),
+                            "_$", "")
+                           )
+    
+    cidents = as.character(scobj$idents[rownames(scobj[[group]])[scobj[[group]] == cellPop]])
+    clusterIdents = unique(cidents)
+    
+    
+    if (!srow)
+    {
+      newa = c(cellPop, varPop, paste(clusterIdents, collapse=";"))
+          cluster_name_file = rbind(cluster_name_file, newa)
+
+    }
+    else {
+      
+      for (clusID in clusterIdents)
+      {
+        newa = c(cellPop, varPop, clusID)
+          cluster_name_file = rbind(cluster_name_file, newa)
+      }
+      
+    }
+    
+    
+    
+  }
+  
+  colnames(cluster_name_file) = c("cname", "fname", "cid")
+  return(cluster_name_file)
+  
+}
+
+cluster_name_file = make_cluster_filename(obj.integrated, "cellnames_manual")
+cluster_name_file_common = make_cluster_filename(obj.integrated, "cellnames_common")
+cluster_name_file_common2 = make_cluster_filename(obj.integrated, "cellnames_common", TRUE)
+
+
+cluster_name_file
+cluster_name_file_common
+cluster_name_file_common2
+
+```
+
+
+```{r eval=F}
+
+get_population_expression_data = function(scobj, group, outname)
+{
+  
+  exprData = list()
+
+  for (cellPop in unique(as.character(unlist(scobj[[group]]))))
+  {
+    print(cellPop)
+    varPop = str_to_lower( str_replace_all(
+                            str_replace_all(#
+                              str_replace_all( cellPop, "\\(|\\)| |,", "_"),
+                              "__", "_"),
+                            "_$", "")
+                           )
+    
+    
+    cellPopCells = rownames(scobj[[group]][scobj[[group]] == cellPop])
+  
+    exprData[[varPop]] = getExprData(markerObj=scobj, markerCells=cellPopCells, sampleSuffix=varPop, slot="counts")
+  }
+  
+  
+  meanExprData = list()
+  
+  for (name in names(exprData))
+  {
+    
+    exprDf = as.data.frame(exprData[[name]])
+    subdf = exprDf[ ,c("gene", paste("mean", name, sep=".")) ]
+  
+    meanExprData[[name]] = subdf
+  }
+  
+  cellnames_manualExprDF = Reduce(function(x,y) merge(x = x, y = y, by = "gene"), meanExprData)
+  
+  write.table(cellnames_manualExprDF, file = paste(outname, ".tsv", sep=""), quote=FALSE, sep = "\t", row.names = F)
+  write_xlsx( cellnames_manualExprDF, path = paste(outname, ".xlsx", sep="") )
+  
+  return(cellnames_manualExprDF)
+  
+  
+}
+
+
+manualExprDF = get_population_expression_data(obj.integrated, "cellnames_manual", "manuscript_plots/exprdf_cellnames_manual")
+commonExprDF = get_population_expression_data(obj.integrated, "cellnames_common","manuscript_plots/exprdf_cellnames_manual_common")
+
+
+```
+
+
+
+
+```{r eval=F}
+
+#ttest
+
+#new.cluster.ids <- c("Neutrophils;Immune system","Macrophages;Immune system","Neutrophils;Immune system","Macrophages;Immune system","Neutrophils;Immune system","NK cells;Immune system","Monocytes;Immune system","Macrophages;Immune system","B cells;Immune system","Neutrophils;Immune system","B cells;Immune system","Neutrophils;Immune system","Neutrophils;Immune system","B cells;Immune system","Macrophages;Immune system","Macrophages;Immune system","Macrophages;Immune system","T memory cells;Immune system","Macrophages;Immune system","Macrophages;Immune system","Macrophages;Immune system","Macrophages;Immune system","Dendritic cells;Immune system")
+#orignames = Idents(obj.integrated)
+#names(new.cluster.ids) <- levels(orignames)
+#levels(orignames) = new.cluster.ids
+#obj.integrated$cellnames = orignames
+
+#mast
+
+#new.cluster.ids <- c("Neutrophils;Immune system","Macrophages;Immune system","Neutrophils;Immune system","Macrophages;Immune system","Neutrophils;Immune system","NK cells;Immune system","Neutrophils;Immune system","Macrophages;Immune system","B cells;Immune system","Neutrophils;Immune system","B cells;Immune system","Neutrophils;Immune system","Neutrophils;Immune system","B cells;Immune system","Macrophages;Immune system","Macrophages;Immune system","Macrophages;Immune system","T memory cells;Immune system","Macrophages;Immune system","Macrophages;Immune system","Macrophages;Immune system","Macrophages;Immune system","Dendritic cells;Immune system")
+
+#orignames = Idents(obj.integrated)
+#names(new.cluster.ids) <- levels(orignames)
+#levels(orignames) = new.cluster.ids
+#obj.integrated$cellnames_mast = orignames
+
+
+
+```
+
+```{r eval=F, fig.width=12, fig.height=5}
+DimPlot(obj.integrated, group.by = "cellnames_manual", label=T)
+```
+
+```{r eval=F, fig.width=12, fig.height=5}
+DimPlot(obj.integrated, group.by = "ident", label=T)
+```
+
+```{r eval=F}
+FeaturePlot(obj.integrated, features = c("percent.mt"), order=T)
+```
+
+
+```{r eval=F, fig.width=36, fig.height=8}
+labelPlot = cowplot::plot_grid(
+  DimPlot(obj.integrated, group.by = "ident", label=T),
+  DimPlot(obj.integrated, group.by = "cellnames_manual", label=T),
+  DimPlot(obj.integrated, group.by = "cellnames", label=T),
+  ncol = 3, labels=c("Cluster", "Manual", "Prediction")
+)
+
+save_plot(labelPlot, "cluster_labels", 36, 8)
+
+```
+
+
+```{r eval=F, fig.width=12, fig.height=8}
+
+FeaturePlot(obj.integrated, reduction = "umap", pt.size = 0.01, features = c("Ccr2", "Csf1r", "Ptprc", "Adgre1", "S100a8", "Cd19"), ncol = 3, order=T)
+
+```
+
+```{r eval=F, fig.width=45, fig.height=30}
+
+DefaultAssay(obj.integrated) = "RNA"
+FeaturePlot(obj.integrated, reduction = "umap", pt.size = 0.001, features = c("Ccr2", "Csf1r", "Lyve1", "EYFP", "Siglecf"), split.by = "sample", order=T)
+
+```
+
+```{r eval=F, fig.width=8, fig.height=6}
+
+DimPlot(obj.integrated, reduction = "umap", label = T, pt.size = 0.001)
+
+```
+
+
+```{r eval=F, fig.width=25, fig.height=6}
+tobiGenes = c("Adgre1", "H2-Q10", "S100a8", "S100a9", "Hdc", "Csf3r", "Il1r2", "Mmp9", "Cxcr2", "Lrg1", "Tnf", "Dusp2", "Icam1", "Bcl2a1a", "Il1a", "Il23a", "Bcl2a1d", "Bcl2a1b", "Tnfaip3", "Nfkbia", "Hdc", "Siglecf", "Apoe", "Pf4", "Spp1", "Arg1", "Trem2", "Mafb", "Spp1", "Irf7", "Ifit2", "Irf7", "Ifit1", "Plac8", "Ccr2", "Ms4a6c", "Ly6c2", "Lrg1", "Ly6g", "H2-Eb1", "H2-Ab1", "H2-Aa", "Cd74", "H2-DMb1", "Cd209a", "Ccr2", "Itgax", "Il1f9", "Ccl3", "Dedd2", "Slc7a11", "Fabp4", "Igfbp7", "Sparc", "Ly6c1", "Cxcl12", "Ccr2", "Timd4", "Selenop", "Lyve1", "Gas6", "Cd163", "C1qa", "C1qc", "C1qb", "Mki67", "Mcm5", "Ccnd1", "Top2a", "Ifi205", "Btla", "Ciita", "Sept3", "Flt3", "Clec9a", "Dpp4", "H2-Eb1", "H2-Aa", "Xcr1")
+
+tobiGenes2 = c("Lyve1", "Cd163", "Pf4", "Trem2", "Stab1", "Csf1r", "Timd4", "Adgre1", "Fcgr1", "Itgam", "S100a8", "Mmp9", "Cxcr2", "H2-DMb1", "H2-Eb1", "H2-Aa", "Tnnt2", "Tnni3", "Tnnc1", "Ccr2", "Arg1", "Plac8", "Chil3", "Ly6c2", "Ear2", "Cx3cr1", "Ace", "Maf", "Selenop", "Fabp4", "Ly6c1", "Cxcl12", "Cd79a", "Cd209a", "Cd209e", "Cd209d", "Cd209b", "Cd209c", "Cd209f", "Cd209g", "Itgax", "Xcr1", "Isg15", "Ifit1", "Irf7", "Tnf", "Icam1", "Dusp2", "Siglecf", "Cxcr2", "Mmp9", "Il1r2", "Csf3r", "Retnlg", "Wfdc21", "Stfa2l1", "Il1f9", "Ccl3", "Ccl4", "Nkg7", "Ms4a4b", "Ccl5","Cd3d", "Cd3e")
+
+tobiGenesSorted = c("Itgam", "S100a8", "Mmp9", "Cxcr2", "Siglecf", "Il1r2", "Csf3r", "Tnf", "Icam1", "Dusp2", "Adgre1", "Fcgr1", "Lyve1", "Cd163", "Pf4", "Trem2", "Stab1", "Csf1r", "Timd4", "Maf", "Selenop", "Ccr2", "Arg1", "Ly6c2", "H2-DMb1", "H2-Eb1", "H2-Aa", "Retnlg", "Cd9", "Wfdc21", "Stfa2l1", "Il1f9", "Ccl3", "Ccl4", "Cd79a", "Isg15", "Ifit1", "Irf7", "Nkg7", "Ms4a4b", "Ccl5", "Ear2", "Cx3cr1", "Ace", "Cd3d", "Cd3e", "Plac8", "Chil3", "Cd209a", "Cd209c", "Cd209d", "Itgax", "Tnnt2", "Tnni3", "Tnnc1", "Fabp4", "Ly6c1", "Cxcl12", "Xcr1")
+
+#tobiGenes = tobiGenes[1:10]
+
+p_dp_idents = DotPlot(obj.integrated, features = unique(c("EYFP", tobiGenes2)), assay="RNA")+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+p_dp_cellnames = DotPlot(obj.integrated, features = unique(c("EYFP", tobiGenes)), assay="RNA", group.by = "cellnames_manual")+theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+
+save_plot(p_dp_idents, "dotplot_idents_tobigenes", fig.width=25, fig.height=6)
+save_plot(p_dp_cellnames, "dotplot_cellnames_tobigenes", fig.width=25, fig.height=6)
+
+
+```
+
+```{r eval=F}
+
+DotPlot(obj.integrated, features = unique(c("Ccr3", "Cd69", "Ccr2", "Ly6c1", "Ly6c2", "Csf1r", "Fcgr3")), assay="RNA")+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+```
+
+
+```{r eval=F, fig.width=30, fig.height=8}
+
+
+markers.use.tt=subset(exprdfTT ,avg_log2FC>0&p_val_adj<0.01&!startsWith(gene, "mt-")&!startsWith(gene, "Rp"))
+finalMarkers.use.tt = markers.use.tt %>% arrange(p_val_adj, desc(abs(pct.1)*abs(avg_log2FC),)) %>% group_by(clusterID) %>% slice(1:20)
+finalMarkers.use.tt
+
+finalMarkers.all.tt = markers.use.tt %>% arrange(p_val_adj, desc(abs(pct.1)*abs(avg_log2FC),)) %>% group_by(clusterID)
+finalMarkers.all.tt = finalMarkers.all.tt[order(finalMarkers.all.tt$clusterID),]
+finalMarkers.all.tt
+```
+
+```{r eval=F, fig.width=30, fig.height=8}
+
+p_dp_genes_idents = DotPlot(obj.integrated, features = unique(finalMarkers.use.tt$gene), assay="RNA")+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1.0, vjust = 0.5))
+
+p_dp_genes_cellnames = DotPlot(obj.integrated, features = unique(finalMarkers.use.tt$gene), assay="RNA", group.by = "cellnames_manual")+ theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+save_plot(p_dp_genes_idents, "dotplot_idents_genes", 30, 8)
+save_plot(p_dp_genes_cellnames, "dotplot_cellnames_genes", 30, 8)
+
+```
+
+
+```{r eval=F}
+DimPlot(obj.integrated, label=T)
+```
+
+
+
+## Plots for Manuscript
+
+```{r eval=F}
+
+save.image("data_manuscript_v4.RData", compress = F)
+
+
+```
+
+
+```{r eval=F}
+obj.integrated
+```
+
+```{r eval=F}
+as.character(new.cluster.manual_common)
+```
+
+
+```{r eval=F, fig.height=18, fig.width=20}
+# plot 3D
+
+
+
+fig3d = DimPlot(obj.integrated, group.by = "cellnames_common", pt.size = 0.01, label = T, label.size=8) + ggtitle("UMAP of Fire IF/NI and Heart1") + theme(text = element_text(size = 28))+xlim(-10,10)+ylim(-10,10)
+
+save_plot(fig3d, "manuscript_plots/figure_3d", fig.width = 20, fig.height = 18)
+
+
+```
+
+```{r eval=F,, fig.width=18, fig.height=6}
+
+# plot 3e
+
+p_dp_genes_idents = DotPlot(obj.integrated, features = unique(finalMarkers.use.tt$gene), assay="RNA")+
+  theme(axis.text.x = element_text(angle = 90, hjust = 1.0, vjust = 0.5))
+
+p_dp_genes_cellnames = DotPlot(obj.integrated, features = unique(finalMarkers.use.tt$gene), assay="RNA", group.by = "cellnames_common")+ theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+clusterGenes = c("EYFP", "Lyve1", "Cd163", "Pf4", "Trem2", "Stab1", "Csf1r", "Timd4", "Adgre1", "Fcgr1", "Itgam", "S100a8", "Mmp9", "Cxcr2", "H2-DMb1", "H2-Eb1", "H2-Aa", "Tnnt2", "Tnni3", "Tnnc1", "Ccr2", "Arg1", "Plac8", "Chil3", "Ly6c2", "Ear2", "Cx3cr1", "Ace", "Maf", "Selenop", "Fabp4", "Ly6c1", "Cxcl12", "Cd79a", "Cd209a", "Cd209e", "Cd209d", "Cd209b", "Cd209c", "Cd209f", "Cd209g", "Itgax", "Xcr1", "Isg15", "Ifit1", "Irf7", "Tnf", "Icam1", "Dusp2", "Siglecf", "Cxcr2", "Mmp9", "Il1r2", "Csf3r", "Retnlg", "Wfdc21", "Stfa2l1", "Il1f9", "Ccl3", "Ccl4", "Nkg7", "Ms4a4b", "Ccl5","Cd3d", "Cd3e")
+
+clusterGenesSorted = c("Itgam", "S100a8", "Mmp9", "Cxcr2", "Siglecf", "Il1r2", "Csf3r", "Tnf", "Icam1", "Dusp2", "Adgre1", "Fcgr1", "Lyve1", "Cd163", "Pf4", "Trem2", "Stab1", "Csf1r", "Timd4", "Maf", "Selenop", "Ccr2", "Arg1", "Ly6c2", "H2-DMb1", "H2-Eb1", "H2-Aa", "Retnlg", "Cd9", "Wfdc21", "Stfa2l1", "Il1f9", "Ccl3", "Ccl4", "Cd79a", "Isg15", "Ifit1", "Irf7", "Nkg7", "Ms4a4b", "Ccl5", "Ear2", "Cx3cr1", "Ace", "Cd3d", "Cd3e", "Plac8", "Chil3", "Cd209a", "Cd209c", "Cd209d", "Itgax", "Tnnt2", "Tnni3", "Tnnc1", "Fabp4", "Ly6c1", "Cxcl12", "Xcr1")
+
+p_dp_genes_selected = DotPlot(obj.integrated, features = unique(clusterGenesSorted), assay="RNA", group.by = "cellnames_common") + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+p_dp_genes_selected_idents = DotPlot(obj.integrated, features = unique(clusterGenesSorted), assay="RNA") + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5))
+
+
+save_plot(p_dp_genes_idents, "manuscript_plots/figure_3e_dotplot_idents_genes", fig.width=42, fig.height=6)
+save_plot(p_dp_genes_cellnames, "manuscript_plots/figure_3e_dotplot_cellnames_genes", fig.width=42, fig.height=6)
+save_plot(p_dp_genes_selected, "manuscript_plots/figure_3e_dotplot_selected_genes", fig.width=18, fig.height=6)
+save_plot(p_dp_genes_selected_idents, "manuscript_plots/figure_3e_dotplot_selected_genes_idents", fig.width=18, fig.height=6)
+
+
+```
+
+```{r eval=F}
+
+plotUMAPs = function(scobj, cells, outnames=NULL, xmin = -10,xmax = 10,ymin = -10,ymax = 10, groupby="cellnames_manual", ncol=3, label=F, legend_rows=2, legend_height=0.1, fig.height=8, fig.width=22, downsample=FALSE)
+{
+  all_elems = list()
+  
+  minCells = min(sapply(X=cells, FUN=length)) 
+
+  for (cellSubsetName in names(cells))
+  {
+    usecells = cells[[cellSubsetName]]
+    origCellCount = length(usecells)
+    
+    if ((downsample) && (length(usecells) > minCells))
+    {
+      usecells = sample(usecells, minCells)
+    }
+
+    print(paste(cellSubsetName, "orig count:", origCellCount, "new count", length(usecells)))
+
+    
+    all_elems[[cellSubsetName]] = DimPlot(subset(scobj, cells= usecells), pt.size = 0.005, group.by=groupby, label=label)+theme(legend.position = "none") + xlim(xmin, xmax) + ylim(ymin, ymax)
+    
+  }
+  
+
+# extract a legend that is laid out horizontally
+legend_b <- get_legend(
+  all_elems[[1]] + 
+    guides(color = guide_legend(nrow = legend_rows, override.aes = list(size=6)))+
+    theme(legend.position = "bottom")
+)
+
+title <- ggdraw() + draw_label("", fontface='bold')
+
+ap = cowplot::plot_grid(
+  plotlist = all_elems, 
+  labels = names(all_elems), ncol=ncol,label_x = 0, label_y = 1,
+  hjust = -0.5, vjust = -0.5#,align="hv",
+)
+
+fp = cowplot::plot_grid(title, ap, legend_b, ncol = 1, rel_heights = c(.05, 1, legend_height) )
+
+if (!is.null(outnames))
+{
+ for (outn in outnames)
+ {
+   print(paste("Saving", outn))
+   cowplot::save_plot(outn, fp, base_height = fig.height, base_width = fig.width) 
+ }
+}
+
+return(fp)
+}
+
+```
+
+
+
+```{r eval=F, fig.height=8, fig.width=16}
+
+plotUMAPs(obj.integrated, list(
+  "FIRE (no-infarct, ctrl)"=c(fire_ct_ni_cells),
+  "FIRE (no-infarct, ko)"=c(fire_ko_ni_cells)
+), ncol=2, legend_rows = 4,legend_height=0.2, downsample = T, groupby = "cellnames_common", fig.height=8, fig.width=16,
+outnames = c("manuscript_plots/figure_3f_umap_fire_ni_overview_downsampled.pdf", "manuscript_plots/figure_3f_umap_fire_ni_overview_downsampled.png","manuscript_plots/figure_3f_umap_fire_ni_overview_downsampled.svg"))
+
+plotUMAPs(obj.integrated, list(
+  "FIRE (no-infarct, ctrl)"=c(fire_ct_ni_cells),
+  "FIRE (no-infarct, ko)"=c(fire_ko_ni_cells)
+), ncol=2, legend_rows = 4,legend_height=0.2, downsample = F, groupby = "cellnames_common", fig.height=8, fig.width=16,
+outnames = c("manuscript_plots/figure_3f_umap_fire_ni_overview.pdf", "manuscript_plots/figure_3f_umap_fire_ni_overview.png", "manuscript_plots/figure_3f_umap_fire_ni_overview.svg"))
+
+```
+
+```{r eval=F}
+
+getCellCountDF = function(scobj, prefix="", group_by="orig.ident", select_by="idents", split_by=NULL, relative=F, outname=NULL,show.percent=F)
+{
+  
+  allClusters = as.character(sort(unique(scobj[[select_by]][,])))
+  
+  if (!is.null(split_by))
+  {
+    allSplits = as.character(sort(unique(scobj[[split_by]][,])))
+  }
+  
+  cellCounts = list()
+  print(allClusters)
+  for (clusterID in allClusters)
+  {
+    print(clusterID)
+    
+    if (!is.null(split_by))
+    {
+      clusterList = list()
+      clusterList[["cluster"]] = clusterID
+      cs = scobj[,scobj[[select_by]] == clusterID]
+      clusterList[["all"]] = nrow(cs[[group_by]])
+
+      for (split_cat in allSplits)
+      {
+          print(paste(clusterID, split_cat))
+        
+          cs = scobj[,scobj[[select_by]] == clusterID & scobj[[split_by]] == split_cat]
+          allElems = table(cs[[group_by]])
+          cs = NULL
+        
+          for (grp in names(allElems))
+          {
+            if (!is.null(prefix))
+            {
+              ngrp = paste(prefix, paste(split_cat, grp, sep="."), sep=".")
+  
+            } else {
+              ngrp = paste(split_cat, grp, sep=".")
+            }
+            clusterList[[ngrp]] = allElems[[grp]]
+          }
+      }
+      
+    } else {
+      
+        cs = scobj[,scobj[[select_by]] == clusterID]
+      
+        allElems = table(cs[[group_by]])
+        clusterList = list()
+        clusterList[["cluster"]] = clusterID
+        clusterList[["all"]] = nrow(cs[[group_by]])
+        cs = NULL
+        
+        for (grp in names(allElems))
+        {
+          if (!is.null(prefix))
+          {
+            ngrp = paste(prefix, grp, sep=".")
+
+          } else {
+            ngrp = grp
+          }
+          clusterList[[ngrp]] = allElems[[grp]]
+        }
+    }
+    
+
+    
+    
+    cellCounts[[clusterID]] = clusterList
+    
+  }
+  df_bysamplerep = cellCounts %>% map(as.data.frame) %>% bind_rows()
+  df_bysamplerep[is.na(df_bysamplerep)] <- 0
+  
+  rownames(df_bysamplerep) = df_bysamplerep$cluster
+  df_bysamplerep$cluster = NULL
+  
+  
+  if (relative)
+  {
+    df_bysamplerep = sweep(df_bysamplerep,2,colSums(df_bysamplerep),"/")
+    
+    if (show.percent)
+    {
+      df_bysamplerep = df_bysamplerep*100;
+    }
+  }
+  
+
+  totals=t(colSums(df_bysamplerep))
+  totals.df = data.frame(totals)
+  rownames(totals.df) = "Total"
+  df_bysamplerep=rbind(df_bysamplerep, totals.df)
+  
+  df_bysamplerep = cbind("cluster"=rownames(df_bysamplerep), df_bysamplerep)
+  rownames(df_bysamplerep) = NULL
+  
+  if (!is.null(outname))
+  {
+    write.table(df_bysamplerep, file=outname, row.names = F,  quote=FALSE, sep='\t')
+  }
+  
+  return(df_bysamplerep)
+  #  
+}
+
+```
+`
+
+
+```{r, fig.height=10, fig.width=8}
+
+countSeurat = subset(obj.integrated, cells=c(fire_ct_ni_cells, fire_ko_ni_cells))
+countByManualCellname = getCellCountDF(countSeurat, prefix="", select_by = "cellnames_common", group_by="sample", relative=TRUE, show.percent=T)
+countByManualCellname
+
+cbc_cname = melt(countByManualCellname)
+cbc_cname$variable_factors = factor(cbc_cname$variable, levels=c("all", ".FIRE_NI_CTRL",".FIRE_NI_KO"))
+cbc_cname = cbc_cname[!cbc_cname$cluster=="Total",]
+
+p=DimPlot(countSeurat, group.by = "cellnames_common")
+g <- ggplot_build(p)
+unique(g$data[[1]]["fill"])
+cellname2color = data.frame(group=g$data[[1]]$group, color=g$data[[1]]$colour, cellnames=obj.integrated$cellnames_common[g$data[[1]]$group])
+
+cbc_cname$cluster = factor(cbc_cname$cluster, levels=levels(p$data$cellnames_common))
+
+
+plot_distribution_celltype = cbc_cname[cbc_cname$variable != "all",] %>%
+ggplot(aes(variable_factors, value, fill=cluster)) + 
+geom_col()+#scale_fill_manual()+
+geom_text_repel(aes(label = paste(round(value, digits = 1))),  size=10, position = position_stack(vjust = .5), direction ="both", segment.size  = 1, segment.color = "black", min.segment.length=0, arrow = arrow(length = unit(0.015, "cm"), angle = 0, type = "closed", ends = "first"), force=2) + ylab("Percentage")+xlab("Condition")+
+  theme(
+        legend.text = element_text(size = 12),
+        axis.text.x = element_text(angle = 0, hjust=0.5, vjust=0.5, size=18),
+        axis.text.y=element_blank(),
+        axis.ticks=element_blank(),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank(),
+        panel.background=element_blank(),
+        panel.border=element_blank(),
+        panel.grid.major=element_blank(),
+        panel.grid.minor=element_blank())
+
+save_plot(plot_distribution_celltype, "manuscript_plots/figure_3g_cluster_percentages_fire_ni", fig.height=10, fig.width=8)
+
+
+```
+
+```{r eval=F}
+
+mysunburst <- function(
+	data,
+	rects.fill="white",
+	rects.fill.aes=0,
+	rects.color="black",
+	rects.size=.5,
+	blank=T,
+	leaf_labels=T,
+	leaf_labels.size = 2,
+	leaf_labels.color = "black",
+  node_labels = F,
+	node_labels.size = 2,
+	node_labels.color = "black",
+	node_labels.min = 90
+  ){
+
+	p <- ggplot(data$rects)
+
+	if (blank) p <- p + theme_void()
+
+	# arcs
+	if (rects.fill.aes == 0){
+		p <- p + geom_rect(
+	    	aes_string(xmin="xmin", xmax="xmax", ymin="ymin",	ymax="ymax", name = "name"),
+	    	 size=rects.size, color=rects.fill, fill=rects.fill)
+	} else {
+		p <- p + geom_rect(
+	    	aes_string(xmin="xmin", xmax="xmax", ymin="ymin",	ymax="ymax", fill=rects.fill.aes),
+   	    	size=rects.size,	color=rects.color)
+	}
+	if (leaf_labels){
+		p <- p + geom_text(data=data$leaf_labels,
+			aes_string(x="x", y="y", label="label", angle="angle"),
+			size=leaf_labels.size, color=leaf_labels.color, hjust=.5)
+ 	}
+  if (node_labels){
+    p <- p + geom_text(data=data$node_labels[data$node_labels$delta_angle >= node_labels.min, ],
+       aes_string(x="x", y="y", label="label", angle="pangle", vjust="pvjust"),
+       size=node_labels.size, color=node_labels.color, hjust=.5)
+  }
+	p + xlab("") + ylab("")
+	
+
+	
+	p = p + ylim(min(data$rects$ymin)-1,NA) +  coord_polar()
+	
+	return(p)
+}
+
+plot_double_pie = function(cbc, wide.threshold=30, rep_narrow=c(1.0, 0.5), rects.fill.aes="name")
+{
+  
+  data = data.frame("level1"=cbc$variable, "level2"=cbc$cluster, "size"=cbc$value)
+
+  names(data) = c("parent", "node", "size")
+  data$location <- data$parent
+  data$node = str_replace_all(data$node, ",", "")
+  
+  write.table(data, file = 'data.csv', row.names = F, sep = ",")
+  sb <- sunburst_data('data.csv', type = 'node_parent', sep = ",", node_attributes = c("location","size"))
+  sb$rects[!sb$rects$leaf,]$location <- sb$rects[!sb$rects$leaf,]$name
+  
+  countByLoc = list()
+  for (uloc in unique(data$location))
+  {
+    countByLoc[[uloc]] = sum(data[data$location==uloc,]$size)
+  }
+  
+  sb$leaf_labels <- within(sb$leaf_labels,{
+    percentage = paste(round(100*size/as.numeric(countByLoc[location]), 2), "%",sep = "")
+    new_label = paste(percentage, sep = " ") #label
+    })
+  
+  wide <- subset(sb$leaf_labels, size > wide.threshold)
+  
+  #name2color$cellnames = str_replace_all(name2color$cellnames, ",", "")
+  #sb$rects = merge(sb$rects, name2color, by.x = "name", by.y="cellnames")
+
+  narrow <- subset(sb$leaf_labels, size <= wide.threshold)
+  
+  if (nrow(narrow) > 0)
+  {
+    narrow$new_y <- rep(rep_narrow, nrow(narrow))[1:nrow(narrow)]  
+  } else {
+    narrow$new_y = c()
+  }
+  
+  newlevels = str_replace_all(levels(cbc$cluster), ",", "")
+  
+  sb$rects$name = factor(sb$rects$name, levels=c(newlevels, setdiff(sb$rects$name, newlevels)))
+  
+  print(c(levels(cbc$cluster), setdiff(sb$rects$name, cbc$cluster)))
+  sb$rects = sb$rects[order(sb$rects$name),]
+
+  
+  print(sb$rects)
+
+  
+  
+  p = mysunburst(sb,
+                  rects.fill.aes = rects.fill.aes,
+                  #rects.fill = sb$rects$color,
+                  rects.size =0.01,
+                  node_labels.size = 5,
+                  leaf_labels.size = 3,
+                  blank = T,
+                  leaf_labels = F,
+                  rects.color = "white",
+                  node_labels = T,
+                  node_labels.color = "white",
+                  node_labels.min = 0
+                ) 
+  
+    text_size <- 5
+
+    if (nrow(wide) > 0)
+    {
+      p = p + geom_segment(data = wide, aes(x=x, xend=x, y=y_out, yend=.1), size = .5) +
+              geom_text(data = wide, aes(x=x, y=.15, label=new_label, angle=angle, hjust=hjust), size = text_size)  
+    }
+    
+  
+    if (nrow(narrow) > 0)
+    {
+      p = p+ geom_segment(data = narrow, aes(x=x, xend=x, y=y_out, yend=new_y), size = .5) +
+              geom_text(data = narrow, aes(x=x, y=new_y, label=new_label, angle=0, hjust=hjust), size = text_size)   
+    }
+    
+  
+    return(list(df=sb$rects, plot=p))
+}
+
+```
+
+```{r eval=F}
+heart_ni_obj = subset(obj.integrated, cells=heart_ni_cells)
+heart_ni_eyfp = as.data.frame(t(GetAssayData( heart_ni_obj["EYFP",] )))
+heart_ni_eyfp$gene = rownames(heart_ni_eyfp)
+
+heart_ni_eyfp_pos_cells = heart_ni_eyfp[heart_ni_eyfp$EYFP>0,]$gene
+heart_ni_eyfp_neg_cells = heart_ni_eyfp[heart_ni_eyfp$EYFP==0,]$gene
+
+print(length(heart_ni_eyfp_pos_cells))
+print(length(heart_ni_eyfp_neg_cells))
+
+cellIdents_hni = Idents(heart_ni_obj)
+cellList_hni = as.character(cellIdents_hni)
+names(cellList_hni) = names(cellList_hni)
+
+cellList_hni[heart_ni_eyfp_pos_cells] = "eYfp.pos"
+cellList_hni[heart_ni_eyfp_neg_cells] = "eYfp.neg"
+heart_ni_obj$EYFP = cellList_hni
+
+p=DimPlot(heart_ni_obj, group.by = "cellnames_common")
+g <- ggplot_build(p)
+cellname2color = unique(data.frame(group=g$data[[1]]$group, color=g$data[[1]]$colour, cellnames=levels(heart_ni_obj$cellnames_common)[g$data[[1]]$group]))
+cellname2color
+
+
+head(heart_ni_eyfp)
+
+countByEYFP = getCellCountDF(heart_ni_obj, prefix=NULL, select_by = "cellnames_common", group_by = "EYFP", relative=F)
+countByEYFP$all = NULL
+countByEYFP
+
+countByEYFP_cbc = melt(countByEYFP)
+countByEYFP_cbc=countByEYFP_cbc[!countByEYFP_cbc$cluster=="Total",]
+countByEYFP_cbc$cluster = factor(countByEYFP_cbc$cluster)
+countByEYFP_cbc
+```
+
+```{r eval=F, fig.height=6, fig.width=6}
+cellname2color
+
+cellname2color$cellnames <- as.character(cellname2color$cellnames)
+ucellname2color = unique(cellname2color)
+
+eyfp_cols = rbind(c(20, "#90EE90", "eYfp.pos"), c(21, "#FA8072", "eYfp.neg"), ucellname2color)
+eyfp_cols
+selcols = eyfp_cols[eyfp_cols$cellnames == c("eYfp.pos", "eYfp.neg"),]
+selcols = selcols[!is.na(selcols$cellnames),]
+selcols
+
+usecolors = eyfp_cols[!is.na(eyfp_cols$cellnames),]$color
+names(usecolors) = str_replace_all(eyfp_cols[!is.na(eyfp_cols$cellnames),]$cellnames, ",", "")
+usecolors
+
+```
+
+```{r eval=F, fig.height=12, fig.width=12}
+alllevels = c(levels(countByEYFP_cbc$cluster), "eYfp.pos", "eYfp.neg")
+alllevels
+
+nuc = usecolors[str_replace_all(alllevels, ",", "")]
+nuc
+
+p_eyfp_pie = plot_double_pie(countByEYFP_cbc, wide.threshold = 10, rep_narrow = c(1.0, 1.5, 2.0, 1.25, 1.75), rects.fill.aes="name")
+
+p_eyfp_pie_plot = p_eyfp_pie$plot + scale_fill_manual(name="Celltype", 
+                        labels = names(nuc), 
+                        values = nuc)
+
+
+save_plot(p_eyfp_pie_plot, "manuscript_plots/figure_3_h_eyfp_pie_chart_heart1", 12, 12)
+
+```
+
+
+```{r eval=F, fig.height=10, fig.width=10}
+
+mac_countByEYFP_cbc = countByEYFP_cbc[grep("Macrophage", countByEYFP_cbc$cluster), ]
+mac_countByEYFP_cbc
+
+alllevels = c(grep("Macrophage",levels(mac_countByEYFP_cbc$cluster), value = T), "eYfp.pos", "eYfp.neg")
+alllevels
+nuc = usecolors[str_replace_all(alllevels, ",", "")]
+nuc
+
+p_eyfp_pie_mac = plot_double_pie(mac_countByEYFP_cbc, wide.threshold = 10, rep_narrow = c(1.0, 1.5, 2.0, 1.25, 1.75), rects.fill.aes="name")
+
+p_eyfp_pie_mac_plot = p_eyfp_pie_mac$plot + scale_fill_manual(name="Celltype", 
+                        labels = names(nuc), 
+                        values = nuc)
+p_eyfp_pie_mac_plot
+
+#p_eyfp_pie_mac = p_eyfp_pie_mac + theme(plot.margin = margin(8,8,8,8, "cm")) + coord_polar(clip="off")
+
+save_plot(p_eyfp_pie_mac_plot, "manuscript_plots/figure_3_h_eyfp_pie_chart_macrophages_heart1", 10,10)
+
+
+
+```
+
+```{r eval=F}
+obj.integrated
+```
+
+
+# figure 7E
+
+```{r eval=F, fig.height=8, fig.width=16}
+
+plotUMAPs(obj.integrated, list(
+  "FIRE (infarct, ctrl)"=c(fire_wt_if_cells),
+  "FIRE (infarct, ko)"=c(fire_ko_if_cells)
+), ncol=2, legend_rows = 4,legend_height=0.2, downsample = T, groupby = "cellnames_common",fig.height=8, fig.width=16,
+outnames = c("manuscript_plots/figure_7e_umap_fire_if_overview_downsampled.pdf", "manuscript_plots/figure_7e_umap_fire_if_overview_downsampled.svg", "manuscript_plots/figure_7e_umap_fire_if_overview_downsampled.png"))
+
+plotUMAPs(obj.integrated, list(
+  "FIRE (infarct, ctrl)"=c(fire_wt_if_cells),
+  "FIRE (infarct, ko)"=c(fire_ko_if_cells)
+), ncol=2, legend_rows = 4,legend_height=0.2, downsample = F, groupby = "cellnames_common",fig.height=8, fig.width=16,
+outnames = c("manuscript_plots/figure_7e_umap_fire_if_overview.pdf","manuscript_plots/figure_7e_umap_fire_if_overview.svg", "manuscript_plots/figure_7e_umap_fire_if_overview.png"))
+
+```
+
+```{r eval=F}
+length(obj.integrated$cellnames)
+```
+
+
+```{r eval=F}
+
+obj.integrated
+
+heartAtlas
+
+obj_heart_atlas
+
+```
+
+
+```{r eval=F, fig.height=30, fig.width=10}
+DimPlot(heartAtlas, reduction = "ref.umap", label = TRUE, split.by = "cell_state", label.size = 3, repel = TRUE, ncol = 1) + ggtitle("Human Heart Cell Atlas")
+
+```
+
+```{r eval=F, fig.height=10, fig.width=10}
+fp_hca=FeaturePlot(obj.integrated, c("Cd4", "Cd8a", "Lyve1", "Dock4"))
+fp_hca = fp_hca & xlim(-10, 10) & ylim(-10,10)
+save_plot(fp_hca, "manuscript_plots/firedata_hca_mac_fp", fig.height=10, fig.width=10)
+
+```
+
+```{r eval=F}
+DimPlot(heartAtlas, reduction = "ref.umap", group.by="cell_state")
+```
+
+
+```{r eval=F, fig.width=17, fig.height=8}
+
+hca_cellnames = obj_heart_atlas$cell_states
+names(hca_cellnames) = paste("human_heart_atlas_", names(hca_cellnames), sep="")
+heartAtlas$cell_state = hca_cellnames
+
+heartAtlas_mac = subset(heartAtlas, cells=names(grep("Ma|Mo", grep("M", heartAtlas$cell_state, value = T), invert=T, value=T)))
+
+
+p1 <- DimPlot(subset(obj.integrated, cells=sample(names(obj.integrated$cellnames_manual), ncol(heartAtlas_mac))), reduction = "umap", label = TRUE, label.size = 3, 
+    repel = FALSE, group.by="cellnames_manual") + NoLegend() + ggtitle("Fire Data") + xlim(-10, 10) + ylim(-10,10)
+p2 <- DimPlot(heartAtlas_mac, reduction = "ref.umap", group.by="cell_state", label = TRUE, 
+    label.size = 3, repel = T) + ggtitle("Human Heart Cell Atlas") + xlim(-10, 10) + ylim(-10,10)
+p1+p2 
+save_plot(p1 + p2, "manuscript_plots/firedata_hca_mac_downsample", fig.height=8, fig.width=17)
+
+```
+
+```{r eval=F, fig.width=14, fig.height=8}
+
+
+for (gene in c("Lyve1", "Chil3", "Gas6", "Ace", "Tnni3"))
+{
+  
+  
+  p1 <- FeaturePlot(subset(obj.integrated, cells=sample(names(obj.integrated$cellnames_manual), ncol(heartAtlas_mac))), gene, reduction = "umap", label = F, label.size = 3,  repel = TRUE) + ggtitle(paste("Fire Data", gene))+ xlim(-10, 10) + ylim(-10, 10)
+  p2 <- FeaturePlot(heartAtlas_mac,gene, reduction = "ref.umap", label = F,
+      label.size = 3, repel = TRUE) + ggtitle(paste("Human Heart Cell Atlas (",gene,")", sep=""))+ xlim(-10, 10) + ylim(-10, 10)
+  
+  pc=ggarrange(p1, p2, ncol=2, nrow=1, common.legend = TRUE, legend="right")
+  save_plot(pc, paste("manuscript_plots/firedata_hca_mac_", gene, sep=""), fig.height=8, fig.width=14)
+  
+}
+
+```
+
+```{r eval=F, fig.width=8, fig.height=12}
+
+p1 <- FeaturePlot(subset(obj.integrated, cells=names(obj.integrated$sample[obj.integrated$sample=="HEART_NI"])), "Lyve1", reduction = "umap", label = F, label.size = 3,  repel = FALSE, order=T) +  ggtitle("Fire Data Lyve1") + xlim(-10, 10) + ylim(-10,10)
+p2 <- DimPlot(heartAtlas_mac, reduction = "ref.umap",label = TRUE, group.by="cell_state",
+    label.size = 3, repel = T) + ggtitle("Human Heart Cell Atlas") + xlim(-10, 10) + ylim(-10,10)
+
+save_plot(p1 + p2, "manuscript_plots/firedata_hca_mac_heart_lyve1", fig.height=12, fig.width=8)
+
+```
+
+```{r eval=F, fig.width=8, fig.height=12}
+
+p1 <- FeaturePlot(subset(obj.integrated, cells=names(obj.integrated$sample[obj.integrated$sample=="HEART_NI"])), "EYFP", reduction = "umap", label = F, label.size = 3,  repel = FALSE, order=T) + NoLegend() + ggtitle("Fire Data eYfp") + xlim(-10, 10) + ylim(-10,10)
+p2 <- DimPlot(heartAtlas_mac, reduction = "ref.umap", label = TRUE,group.by="cell_state",
+    label.size = 3, repel = T) + ggtitle("Human Heart Cell Atlas") + xlim(-10, 10) + ylim(-10,10)
+
+save_plot(p1 + p2, "manuscript_plots/firedata_hca_mac_heart_eyfp", fig.height=12, fig.width=8)
+
+```
+
+
+
+```{r eval=F, fig.height=7, fig.width=8}
+
+hca_dimp <- DimPlot(heartAtlas_mac, reduction = "ref.umap", group.by="cell_state", label = TRUE, 
+    label.size = 3, repel = T) + ggtitle("Human Heart Cell Atlas") + xlim(-10, 10) + ylim(-10,10)
+
+save_plot(hca_dimp, "manuscript_plots/firedata_hca_mac_dimp", fig.height=7, fig.width=8)
+```
+
+#figure 7F
+
+```{r eval=F,, fig.height=10, fig.width=8}
+
+countSeurat_if = subset(obj.integrated, cells=c(fire_wt_if_cells, fire_ko_if_cells))
+countByManualCellname_if = getCellCountDF(countSeurat_if, prefix="", select_by = "cellnames_common", group_by="sample", relative=TRUE, show.percent=T)
+countByManualCellname
+
+cbc_cname_if = melt(countByManualCellname_if)
+print(cbc_cname_if$variable)
+cbc_cname_if$variable_factors = factor(cbc_cname_if$variable, levels=c("all", ".FIRE_IF_WT",".FIRE_IF_KO"))
+cbc_cname_if = cbc_cname_if[!cbc_cname_if$cluster=="Total",]
+
+p=DimPlot(countSeurat_if, group.by = "cellnames_common")
+g <- ggplot_build(p)
+unique(g$data[[1]]["fill"])
+cellname2color = data.frame(group=g$data[[1]]$group, color=g$data[[1]]$colour, cellnames=countSeurat_if$cellnames_common[g$data[[1]]$group])
+
+cbc_cname_if$cluster = factor(cbc_cname_if$cluster, levels=levels(p$data$cellnames_common))
+cbc_cname_if
+
+plot_distribution_celltype_if = cbc_cname_if[cbc_cname_if$variable != "all",] %>%
+ggplot(aes(variable_factors, value, fill=cluster)) + 
+geom_col()+#scale_fill_manual()+
+geom_text_repel(aes(label = paste(round(value, digits = 1))),  size=10, position = position_stack(vjust = .5), direction ="both", segment.size  = 1, segment.color = "black", min.segment.length=0, arrow = arrow(length = unit(0.015, "cm"), angle = 0, type = "closed", ends = "first"), force=2) + ylab("Percentage")+xlab("Condition")+
+  theme(
+        legend.text = element_text(size = 12),
+        axis.text.x = element_text(angle = 0, hjust=0.5, vjust=0.5, size=18),
+        axis.text.y=element_blank(),
+        axis.ticks=element_blank(),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank(),
+        panel.background=element_blank(),
+        panel.border=element_blank(),
+        panel.grid.major=element_blank(),
+        panel.grid.minor=element_blank())
+
+
+save_plot(plot_distribution_celltype_if, "manuscript_plots/figure_7f_cluster_percentages_fire_if", fig.height=10, fig.width=8)
+
+
+```
+
+#figure 7G
+
+
+```{r eval=F}
+
+DotPlot(obj.sbs, feature="Csf1r", group.by="cellnames_common")
+
+```
+
+
+```{r eval=F}
+obj.sbs = subset(obj.integrated, cells=c(fire_wt_if_cells,fire_ko_if_cells))
+
+plotElems = list()
+plotElems[["Fire IF WT"]] = list(cells=fire_wt_if_cells, label="Fire IF WT")
+plotElems[["Fire IF KO"]] = list(cells=fire_ko_if_cells, label="Fire IF KO")
+
+
+plot_list = list()
+
+for (plotName in names(plotElems))
+{
+    print(plotName)
+    plotData = plotElems[[plotName]]
+    plotCells = plotData$cells
+    plotDescr = plotData$label
+
+    plotElem_orig = DotPlot(subset(obj.sbs, cells=plotCells), features=sbsFeatures, group.by = "cellnames_common", col.min = -3, col.max=3, scale=F)
+    
+    plot_list[[plotName]] = plotElem_orig
+}
+
+
+```
+
+```{r eval=F}
+
+df1 = plot_list$`Fire IF WT`$data
+df2 = plot_list$`Fire IF KO`$data
+
+df1["sample"] = "Fire IF WT"
+df2["sample"] = "Fire IF KO"
+
+dfall = rbind(df1, df2)
+dfall["avg.exp.scaled2"] = scale(dfall$avg.exp)
+
+dfall["sampleid"] = paste(dfall$features.plot, dfall$sample, sep=" - ")
+
+newlevels = c()
+for (gene in unique(dfall$features.plot))
+{
+  for (sample in sort(unique(dfall$sample), decreasing = T))
+  {
+    newlevels = c(newlevels, paste(gene, sample, sep=" - "))
+  }
+}
+
+newlevels
+
+dfall["sampleid_fac"] = factor(dfall$sampleid, newlevels)
+dfall["sampleorder"] =  as.numeric(dfall$sampleid_fac)
+dfall["sample"] = factor(dfall$sample, unique(dfall$sample))
+
+dfall = dfall[order(dfall$sampleorder),]
+dfall
+```
+
+
+
+```{r eval=F}
+library(magrittr)
+library(ggforestplot)
+
+```
+
+```{r eval=F}
+usedf$id = as.character(usedf$id)
+usedf
+```
+
+```{r eval=F}
+as.numeric(usedf$sampleid_fac)
+```
+
+```{r eval=F}
+usedf
+```
+
+
+```{r eval=F, fig.height=10, fig.width=15}
+#usedf = dfall[order(dfall$sampleid_fac, decreasing = F),]
+usedf = dfall[c("sampleid_fac", "id", "sample", "avg.exp.scaled2", "pct.exp")]
+rownames(usedf) = NULL
+usedf
+
+
+odd_numbers = odd_numbers <- seq(1,nrow(usedf)/ (length(unique(usedf$id))*1) ,2)
+even_numbers = even_numbers <- seq(2,nrow(usedf)/(length(unique(usedf$id))*1),2)
+even_numbers_div = even_numbers_div <- seq(2,nrow(usedf)/(length(unique(usedf$id))*1)-2,2)
+
+rects <- data.frame(xstart = as.numeric(usedf$sampleid_fac)-0.5, xend = as.numeric(usedf$sampleid_fac)+0.5, col = rep(c("r", "g"), 2))
+#      geom_rect(aes(ymin=0, ymax=10, xmin=sampleid_fac,xmax=sampleid_fac, alpha =0.5))+
+
+df2 <- usedf %>% mutate(sampleid_facn=as.numeric(sampleid_fac), idn=as.numeric(id))
+df2$color = "#F47B78"
+df2[df2$sample == "Fire IF WT",]$color = "#448CCA"
+
+      p = ggplot(df2,aes(x=sampleid_facn, y=idn, colour = avg.exp.scaled2, size = pct.exp)) +
+      geom_rect(aes(xmin=sampleid_facn-.5, xmax=sampleid_facn+.5, ymin = 0.5, ymax = Inf, fill = color), alpha = 0.02, linetype="blank") +
+      geom_point() +
+      scale_x_continuous(breaks=df2$sampleid_facn, labels=df2$sampleid_fac) +
+      scale_y_continuous(breaks=df2$idn, labels=df2$id)+
+      scale_size(range = c(1,10)) + theme_bw() + 
+      guides(color= guide_legend(title="Avg. Expression (scaled)"), size=guide_legend(title="Percent Expressing")) +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5),text = element_text(size = 20),
+            legend.background = element_blank(),
+            legend.box.background = element_blank(),
+            legend.key = element_blank(),
+            legend.position="bottom", panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line())+
+      xlab("Sample / Gene") + ylab("Population")
+
+     save_plot(p, paste("manuscript_plots/figure_7g_dot_plot_scaled", gene, sep=""), fig.height=10, fig.width=15)
+
+     #  geom_rect(data = usedf[odd_numbers, ], xmin = odd_numbers - 0.5, xmax = odd_numbers + 0.5, ymin = -Inf, ymax = Inf, fill = '#FACAC9', linetype="blank", alpha=0.5) +
+#    geom_rect(data = usedf[even_numbers, ], xmin = even_numbers - 0.5, xmax = even_numbers + 0.5, ymin = -Inf, ymax = Inf, fill = '#B4D1E9', linetype="blank", alpha=0.5) +
+#    geom_rect(data = usedf[even_numbers_div, ], xmin = even_numbers_div + 0.45, xmax = even_numbers_div + 0.55, ymin = -Inf, ymax = Inf, fill = 'white', linetype="blank", alpha=0.75) +
+  
+  #+ scale_x_discrete(limits=usedf$sampleid_fac)+
+  
+    #names(keyvals)[keyvals == '#F47B78'] <- 'More KO sig'
+    #names(keyvals)[keyvals == '#FACAC9'] <- 'More KO non-sig'
+    #names(keyvals)[keyvals == '#448CCA'] <- 'More WT/CTRL sig'
+    #names(keyvals)[keyvals == '#B4D1E9'] <- 'More WT/CTRL non-sig'
+```
+
+```{r eval=F, fig.height=10, fig.width=15}
+#usedf = dfall[order(dfall$sampleid_fac, decreasing = F),]
+usedf = dfall[c("sampleid_fac", "id", "sample", "avg.exp.scaled2", "pct.exp")]
+rownames(usedf) = NULL
+usedf
+
+
+df2 <- usedf %>% mutate(sampleid_facn=as.numeric(sampleid_fac), idn=as.numeric(id))
+df2$color = "#F47B78"
+df2[df2$sample == "Fire IF WT",]$color = "#448CCA"
+
+      ggplot(df2,aes(x=sampleid_facn, y=idn, colour = avg.exp.scaled2, size = pct.exp)) +
+      geom_rect(aes(xmin=sampleid_facn-.5, xmax=sampleid_facn+.5, ymin = idn-0.5, ymax = idn+0.5, fill = sampleid_facn), alpha = 0.8, linetype="blank") +
+      geom_point() +
+      scale_x_continuous(breaks=df2$sampleid_facn, labels=df2$sampleid_fac) +
+      scale_y_continuous(breaks=df2$idn, labels=df2$id)+
+      scale_size(range = c(1,10)) + theme_bw() + 
+      guides(color= guide_legend(title="Avg. Expression (scaled)"), size=guide_legend(title="Percent Expressing")) +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5),text = element_text(size = 20),
+            legend.background = element_blank(),
+            legend.box.background = element_blank(),
+            legend.key = element_blank(),
+            legend.position="bottom", panel.grid.major = element_blank(), panel.grid.minor = element_blank(),
+panel.background = element_blank(), axis.line = element_line())+
+      xlab("Sample / Gene") + ylab("Population")
+      
+```
+
+
+
+```{r eval=F}
+
+my_levels = sort(unique(obj.sbs@meta.data$sample), decreasing = T)
+obj.sbs@meta.data$sample = factor(x = obj.sbs@meta.data$sample, levels = my_levels)
+
+```
+
+
+```{r eval=F, fig.height=5, fig.width=15}
+
+for (gene in sbsFeatures)
+{
+  
+  p=VlnPlot(obj.sbs, gene, group.by = "cellnames_common", pt.size = 0, split.by = "sample", y.max = 8, cols = list("#448CCA","#F47B78"))
+  p = p + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+  
+  save_plot(p, paste("manuscript_plots/gene_violins/", gene, sep=""), fig.height = 5, fig.width = 15)
+  plot(p)
+}
+
+```
+
+```{r eval=F, fig.height=5, fig.width=15}
+
+obj.ni = subset(obj.integrated, cells=c(fire_ct_ni_cells, fire_ko_ni_cells))
+
+my_levels = sort(unique(obj.ni@meta.data$sample), decreasing = F)
+obj.ni@meta.data$sample = factor(x = obj.ni@meta.data$sample, levels = my_levels)
+
+for (gene in sbsFeatures)
+{
+  
+  p=VlnPlot(obj.ni, gene, group.by = "cellnames_common", pt.size = 0, split.by = "sample", y.max = 8, cols = list("#448CCA", "#F47B78"))
+  p = p + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+  
+  save_plot(p, paste("manuscript_plots/gene_violins_ni/", gene, sep=""), fig.height = 5, fig.width = 15)
+  plot(p)
+}
+
+
+```
+
+
+```{r eval=F, fig.height=5, fig.width=15}
+
+obj.ni = subset(obj.integrated, cells=c(fire_ko_if_cells, fire_ko_ni_cells))
+
+my_levels = sort(unique(obj.ni@meta.data$sample), decreasing = T)
+obj.ni@meta.data$sample = factor(x = obj.ni@meta.data$sample, levels = my_levels)
+
+for (gene in sbsFeatures)
+{
+  
+  p=VlnPlot(obj.ni, gene, group.by = "cellnames_common", pt.size = 0, split.by = "sample", y.max = 8, cols = list("#fac0bf","#F47B78"))
+  p = p + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+  
+  save_plot(p, paste("manuscript_plots/gene_violins_fire_ko/", gene, sep=""), fig.height = 5, fig.width = 15)
+  plot(p)
+}
+
+
+```
+
+```{r eval=F, fig.height=5, fig.width=15}
+
+obj.ni = subset(obj.integrated, cells=c(fire_ct_ni_cells, fire_wt_if_cells))
+
+my_levels = sort(unique(obj.ni@meta.data$sample), decreasing = T)
+obj.ni@meta.data$sample = factor(x = obj.ni@meta.data$sample, levels = my_levels)
+
+for (gene in sbsFeatures)
+{
+  
+  p=VlnPlot(obj.ni, gene, group.by = "cellnames_common", pt.size = 0, split.by = "sample", y.max = 8, cols = list("#80b1db","#448CCA"))
+  p = p + theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust=0.5))
+  
+  save_plot(p, paste("manuscript_plots/gene_violins_fire_wt/", gene, sep=""), fig.height = 5, fig.width = 15)
+  plot(p)
+}
+
+
+```
+
+
+# DE Analysis
+
+
+```{r eval=F}
+compareClusters = function(scdata, cellsID1, cellsID2, suffix1, suffix2, prefix="cluster", test="MAST", assay="RNA", outfolder="./", all=FALSE)
+{
+    logfc.threshold = 0.25
+    
+    if (all==TRUE)
+    {
+    logfc.threshold = 0.01  
+    }
+    
+    markers = FindMarkers(scdata, assay=assay, ident.1 = cellsID1, ident.2 = cellsID2, test.use=test, logfc.threshold=logfc.threshold)
+    
+    outvalues1 = getExprData(scdata, cellsID1, suffix1)
+    outvalues2 = getExprData(scdata, cellsID2, suffix2) 
+    
+    
+    markers$gene = rownames(markers)
+    joinedData = merge(markers, outvalues1, by="gene", all=T)
+    joinedData = merge(joinedData, outvalues2, by="gene", all=T)  
+    
+    joinedData = joinedData[!is.na(joinedData$p_val),]
+    
+    suffix1=str_replace(suffix1, " ", "_")
+    suffix2=str_replace(suffix2, " ", "_")
+    
+    outfile = paste(outfolder, "/", prefix, ".", suffix1, "_", suffix2, ".tsv", sep="")
+    
+    message(outfile)
+    write.table(joinedData, file=outfile, row.names = F,  quote=FALSE, sep='\t')
+    
+    outfile = paste(outfolder, "/", prefix, ".", suffix1, "_", suffix2, ".xlsx", sep="")
+    
+    message(outfile)
+    write_xlsx(joinedData, path=outfile)
+    
+    return(joinedData)
+}
+```
+
+```{r eval=F}
+compareCellsByCluster = function(inobj, cellsID1, cellsID2, suffix1, suffix2, group.by=NULL, assay="RNA", test="t", outfolder="./", all=FALSE)
+{
+  if (is.null(group.by))
+  {
+    clusterIDs = as.character(sort(unique(Idents(inobj))))  
+  } else {
+    clusterIDs = as.character(sort(unique(inobj[[group.by]][,])))
+  }
+  
+  retList = list()
+  
+  for(clusterID in clusterIDs)
+  {
+  
+      cellIdents = Idents(inobj)
+      
+      if (is.null(group.by))
+      {
+        cellIdents.c = names(cellIdents[cellIdents == clusterID])
+  
+      } else {
+        cellIdents.c = colnames(inobj[,inobj[[group.by]] == clusterID])
+      }
+      
+      cellIdents.c = unlist(lapply(cellIdents.c, as.character))
+  
+      print(paste("Processing cluster", clusterID, "with a total of", length(cellIdents.c), "cells"))
+      
+      cells1 = intersect(cellsID1, cellIdents.c)
+      cells2 = intersect(cellsID2, cellIdents.c)
+      
+      print(c(length(cells1), length(cells2)))
+      
+      if (length(cells1) < 3)
+      {
+        print("Cells1 too few")
+        next
+      }
+      
+      if (length(cells2) < 3)
+      {
+        print("Cells2 too few")
+        next
+      }
+  
+      deMarkers = compareClusters(scdata=inobj,
+                                  cellsID1=cells1,
+                                  cellsID2=cells2,
+                                  prefix= paste("cluster", clusterID, sep="_"),
+                                  suffix1=suffix1,#paste(suffix1, clusterID, sep="_"),
+                                  suffix2=suffix2, #paste(suffix2, clusterID, sep="_"),
+                                  test="t", assay="RNA", outfolder=outfolder)
+  
+  
+      retList[[clusterID]] = deMarkers
+  
+  }
+  
+  return(retList)
+
+}
+
+```
+
+
+```{r eval=F}
+mergeLists = function(inlist)
+{
+clusterIDs = names(inlist)
+
+retDF = NULL
+
+for (clusterID in clusterIDs)
+{
+    listDF = inlist[[clusterID]]
+    
+    listDF$clusterID = clusterID
+    
+    print(clusterID)
+    
+    if (!is.null(retDF))
+    {
+      retDF = as.data.frame(rbind(retDF, listDF))
+    } else {
+      retDF = listDF
+    }
+    
+
+}
+
+return(retDF)
+
+}
+```
+
+
+```{bash}
+mkdir -p manuscript_plots/volcano_fire_if
+mkdir -p manuscript_plots/volcano_fire_ni
+
+mkdir -p manuscript_plots/detests_fire_if
+mkdir -p manuscript_plots/detests_fire_ni
+
+mkdir -p manuscript_plots/go_fire_if
+mkdir -p manuscript_plots/go_fire_ni
+
+mkdir -p manuscript_plots/gse_fire_if
+mkdir -p manuscript_plots/gse_fire_ni
+
+mkdir -p manuscript_plots/ra_fire_if
+mkdir -p manuscript_plots/ra_fire_ni
+```
+
+
+```{bash}
+
+rm manuscript_plots/volcano_fire_if/*
+rm manuscript_plots/volcano_fire_ni/*
+
+rm manuscript_plots/detests_fire_if/*
+rm manuscript_plots/detests_fire_ni/*
+
+rm manuscript_plots/go_fire_if/*
+rm manuscript_plots/go_fire_ni/*
+
+rm manuscript_plots/gse_fire_if/*
+rm manuscript_plots/gse_fire_ni/*
+
+rm manuscript_plots/ra_fire_if/*
+rm manuscript_plots/ra_fire_ni/*
+
+```
+
+```{r eval=F}
+
+fire_ni_results = compareCellsByCluster(obj.integrated,
+             fire_ct_ni_cells,
+             fire_ko_ni_cells,
+             "control", "knockout", group.by="cellnames_common", test="t", outfolder="manuscript_plots/detests_fire_ni")
+
+fire_if_results = compareCellsByCluster(obj.integrated,
+             fire_wt_if_cells,
+             fire_ko_if_cells,
+             "wildtype", "knockout", group.by="cellnames_common", test="t", outfolder="manuscript_plots/detests_fire_if")
+
+
+```
+
+```{r eval=F}
+cluster_name_file
+```
+
+
+```{r eval=F}
+
+de_df = merge(finalMarkers.use.tt[,c("clusterID", "gene")], cluster_name_file_common2, by.x="clusterID", by.y="cid")
+de_df
+
+de_all_df = merge(finalMarkers.all.tt[,c("clusterID", "gene", "p_val_adj", "avg_log2FC")], cluster_name_file_common2, by.x="clusterID", by.y="cid")
+de_all_df
+
+```
+
+```{r eval=F}
+finalMarkers.all.tt
+```
+
+
+```{r eval=F}
+unique(de_all_df$clusterID)
+```
+
+
+```{r eval=F}
+
+volcano_list_de = list()
+
+
+for (cid in unique(obj.integrated$idents))
+{
+  
+  seldf = de_df[de_df$clusterID == cid,]
+  genes = as.vector(seldf$gene)
+  
+  degenes = de_all_df[de_all_df$clusterID == cid,]
+  degenes = degenes[degenes$p_val_adj < 0.05,]
+  
+  cfname = unique(degenes$fname)[1]
+  
+  print(paste(cid, cfname, length(genes)))
+  print(degenes)
+
+    print(cid)
+    
+    adf = degenes[order(degenes$p_val_adj),]
+    
+    print(adf)
+    
+    if (nrow(adf) > 25)
+    {
+      adf = adf[1:25,]
+    }
+    
+    genes=as.vector(adf$gene)
+  
+  
+  volcano_list_de[[ cid ]] = list("genes"=genes, "fname"=cfname)
+}
+
+volcano_list_de
+
+
+
+```
+
+
+```{r eval=F, fig.width=12, fig.height=7}
+
+makeVolcanos = function(loMG, titlePrefix, outname, restrict_labels=NULL, turnExpression=F, colors = list(neg=list(sig="#448CCA", nosig="#B4D1E9"), pos=list(sig="#F47B78", nosig="#FACAC9")))
+{
+  
+  for (cName in names(loMG))
+  {
+    print(cName)
+    
+    title=paste(titlePrefix, "(", cName, ")", sep=" ")
+    subtitle=""
+    
+    pCutoff=0.05
+    FCcutoff=0.5
+    
+    indf = loMG[[cName]]
+    
+    popName = str_to_lower( str_replace_all(str_replace_all(str_replace_all( cName, "\\(|\\)| ", "_"), "__", "_"), "_$", "") )
+
+    plotlabels = NULL
+    
+    if (cName %in% names(restrict_labels))
+    {
+        cInfoElem = restrict_labels[[cName]]
+      
+        popName = cInfoElem$fname
+        plotlabels = cInfoElem$genes
+    }
+    
+    filename=paste(outname, popName, "png", sep=".")
+    
+    print(filename)
+    print(plotlabels)
+    
+    if (turnExpression)
+    {
+      indf$avg_log2FC = -indf$avg_log2FC
+    }
+    
+    
+    
+    keyvals <- ifelse(indf$avg_log2FC > 0,
+                      
+                      ifelse(indf$p_val_adj < pCutoff & indf$avg_log2FC > FCcutoff, colors$pos$sig, colors$pos$nosig)
+                      ,
+                      ifelse(indf$avg_log2FC <= 0,
+                             ifelse(indf$p_val_adj < pCutoff & indf$avg_log2FC < -FCcutoff, colors$neg$sig, colors$neg$nosig)
+                             ,
+                             'black'))
+    
+    
+    keyvals[is.na(keyvals)] <- 'black'
+    names(keyvals)[keyvals == '#F47B78'] <- 'More KO sig'
+    names(keyvals)[keyvals == '#FACAC9'] <- 'More KO non-sig'
+    names(keyvals)[keyvals == '#448CCA'] <- 'More WT/CTRL sig'
+    names(keyvals)[keyvals == '#B4D1E9'] <- 'More WT/CTRL non-sig'
+    
+    txtLabelSize = 5
+    axisLabelSize=12
+    legendLabSize=12
+    legendIconSize=5.0
+  
+    
+    png(filename=filename,width = 1200, height = 700)
+    p=EnhancedVolcano(indf,
+      lab = indf$gene,
+      selectLab=plotlabels,
+      x = 'avg_log2FC',
+      y = 'p_val_adj',
+      colCustom = keyvals,
+      pCutoff = pCutoff,
+      FCcutoff = FCcutoff,
+      pointSize = 2.0,
+      legendPosition = 'right',
+      drawConnectors = TRUE,
+      widthConnectors = 0.5,
+      title = title,
+      subtitle = subtitle,
+      axisLabSize=axisLabelSize,
+      labSize = txtLabelSize,
+      legendLabSize = legendLabSize,
+      legendIconSize = legendIconSize,
+      ylab = bquote(~-Log[10]~italic(adj~P-Value)),
+      gridlines.major = FALSE,
+      gridlines.minor = FALSE
+     )
+    plot(p)
+    dev.off()
+    
+    
+        filename=paste(outname, popName, "pdf", sep=".")
+    print(filename)
+        pdf(filename,width = 12, height = 7)
+    p=EnhancedVolcano(indf,
+      lab = indf$gene,
+      selectLab=plotlabels,
+      x = 'avg_log2FC',
+      y = 'p_val_adj',
+      colCustom = keyvals,
+      pCutoff = pCutoff,
+      FCcutoff = FCcutoff,
+      pointSize = 2.0,
+      legendPosition = 'right',
+      drawConnectors = TRUE,
+      widthConnectors = 0.5,
+      title = title,
+      subtitle = subtitle,
+      axisLabSize=axisLabelSize,
+      labSize = txtLabelSize,
+      legendLabSize = legendLabSize,
+      legendIconSize = legendIconSize,
+      ylab = bquote(~-Log[10]~italic(adj~P-Value)),
+      gridlines.major = FALSE,
+      gridlines.minor = FALSE
+     )
+    plot(p)
+    dev.off()
+    
+    filename=paste(outname, popName, "svg", sep=".")
+    print(filename)
+    svglite(file = filename, width = 12, height = 7)
+
+    p=EnhancedVolcano(indf,
+      lab = indf$gene,
+      selectLab=plotlabels,
+      x = 'avg_log2FC',
+      y = 'p_val_adj',
+      colCustom = keyvals,
+      pCutoff = pCutoff,
+      FCcutoff = FCcutoff,
+      pointSize = 2.0,
+      legendPosition = 'right',
+      drawConnectors = TRUE,
+      widthConnectors = 0.5,
+      title = title,
+      subtitle = subtitle,
+      axisLabSize=axisLabelSize,
+      labSize = txtLabelSize,
+      legendLabSize = legendLabSize,
+      legendIconSize = legendIconSize,
+      ylab = bquote(~-Log[10]~italic(adj~P-Value)),
+      gridlines.major = FALSE,
+      gridlines.minor = FALSE
+     )
+    plot(p)
+    dev.off()
+  
+    plot(p)
+    
+  }
+  
+}
+
+
+
+
+```
+
+```{bash}
+rm manuscript_plots/volcano_fire_if/*
+rm manuscript_plots/volcano_fire_ni/*
+```
+
+```{r eval=F}
+
+chkdf = fire_if_results$`Neutrophils (SiglecF hi)`
+chkdf[order(chkdf$avg_log2FC),]
+
+```
+
+
+```{r eval=F}
+library(EnhancedVolcano)
+```
+
+
+```{r eval=F, fig.height=8, fig.width=12}
+
+makeVolcanos(fire_ni_results, "Fire (non-infarct)", "manuscript_plots/volcano_fire_ni/volcano", restrict_labels = volcano_list_de, turnExpression = T)
+makeVolcanos(fire_if_results, "Fire (infarct)", "manuscript_plots/volcano_fire_if/volcano", restrict_labels = volcano_list_de, turnExpression = T)
+
+
+```
+
+```{bash}
+
+mkdir -p ra_fire_if
+mkdir -p ra_fire_ni
+mkdir -p ra_ccr2_if
+
+mkdir -p go_fire_if
+mkdir -p go_fire_ni
+mkdir -p go_ccr2_if
+
+mkdir -p gse_fire_if
+mkdir -p gse_fire_ni
+mkdir -p gse_ccr2_if
+
+
+rm ra_fire_if/*
+rm ra_fire_ni/*
+rm ra_ccr2_if/*
+
+rm go_fire_if/*
+rm go_fire_ni/*
+rm go_ccr2_if/*
+
+rm gse_fire_if/*
+rm gse_fire_ni/*
+rm gse_ccr2_if/*
+
+```
+
+```{r eval=F}
+
+saveRDS(rownames(obj.integrated), "go_universe.Rds")
+
+saveRDS(fire_ni_results, "fire_ni_results.Rds")
+saveRDS(fire_if_results, "fire_if_results.Rds")
+saveRDS(ccr2_if_results, "ccr2_if_results.Rds")
+
+
+saveRDS(obj.integrated, "obj_integrated.Rds")
+
+
+```
+
+```{r eval=F}
+save.image("before_genesets.RData", compress = F)
+```
+
+
+```{r eval=F}
+
+save.image("data_manuscript_v4.done.RData", compress = F)
+
+```
+
+
